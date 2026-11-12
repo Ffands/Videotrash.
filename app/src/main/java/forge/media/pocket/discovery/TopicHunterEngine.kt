@@ -901,6 +901,40 @@ class TopicHunterEngine(private val context: Context) {
         collected.take(limitCount)
     }
 
+    /**
+     * Background filler search entry point used by TelegramBotWorker.
+     * Applies strict mid-video 3-frame inspection + semantic anti-cartoon/anti-guide filter.
+     */
+    suspend fun searchBackgroundCandidates(
+        topicQuery: String,
+        limitCount: Int = 6
+    ): List<DiscoveredMediaCandidate> = withContext(Dispatchers.IO) {
+        val session = MultiPlatformCrawlSession(
+            rawQuery = topicQuery,
+            negativeTags = SearchBlacklistStore.bgNegativeTags.value,
+            platform = HuntPlatform.YOUTUBE,
+            sortOrder = ContentSortOrder.RELEVANCE,
+            period = SearchTimePeriod.ALL_TIME,
+            durationMode = SearchDurationMode.ANY_UP_TO_6M,
+            languageMode = SearchLanguageMode.ANY_LANGUAGE,
+            isBackgroundMode = true,
+            enableAiCuration = true
+        )
+        val collected = mutableListOf<DiscoveredMediaCandidate>()
+        var attempts = 0
+        while (collected.size < limitCount && session.hasMorePages() && attempts < 4) {
+            attempts++
+            val batch = crawlNextPage(session)
+            for (c in batch) {
+                if (collected.none { SearchBlacklistStore.areTitlesNearDuplicates(it.title, c.title) }) {
+                    collected.add(c)
+                }
+            }
+            if (batch.isEmpty() && attempts >= 2) break
+        }
+        collected.take(limitCount)
+    }
+
     // =========================================================================
     // 1. YOUTUBE INNERTUBE CRAWLER
     // =========================================================================

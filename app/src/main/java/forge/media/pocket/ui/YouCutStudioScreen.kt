@@ -35,8 +35,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedButton
@@ -213,8 +211,8 @@ fun YouCutStudioScreen(
     var layoutLayer by remember { mutableStateOf(VideoLayoutLayer.SPLIT_VSTACK) }
     var splitTopRatio by remember { mutableFloatStateOf(0.52f) }
     var primaryZoom by remember(primaryFile?.absolutePath) { mutableFloatStateOf(1.0f) }
-    var primaryPanX by remember(primaryFile?.absolutePath) { mutableFloatStateOf(0.0f) } // -1..1
-    var primaryPanY by remember(primaryFile?.absolutePath) { mutableFloatStateOf(0.0f) } // -1..1
+    var primaryPanX by remember(primaryFile?.absolutePath) { mutableFloatStateOf(0.0f) }
+    var primaryPanY by remember(primaryFile?.absolutePath) { mutableFloatStateOf(0.0f) }
 
     var bgZoom by remember(backgroundFile?.absolutePath) { mutableFloatStateOf(1.0f) }
     var bgPanX by remember(backgroundFile?.absolutePath) { mutableFloatStateOf(0.0f) }
@@ -256,7 +254,7 @@ fun YouCutStudioScreen(
     var replacementMusicFile by remember { mutableStateOf<File?>(null) }
 
     var voiceoverDubMode by remember { mutableStateOf(VoiceoverDubMode.OFF) }
-    var selectedVoiceProfile by remember { mutableStateOf(TtsVoiceProfile.MALE_NARRATOR_DEEP) }
+    var selectedVoiceProfile by remember { mutableStateOf(TtsVoiceProfile.CHARON_DEEP) }
     var dubScriptText by remember { mutableStateOf("") }
     var generatedVoiceoverFile by remember { mutableStateOf<File?>(null) }
     var isGeneratingDub by remember { mutableStateOf(false) }
@@ -665,7 +663,7 @@ fun YouCutStudioScreen(
                 }
                 val targetDur = if (isPreview5s) flatDur.coerceAtMost(5.0) else flatDur
 
-                val preparedBgFile: File = if (needsFiller && backgroundFile != null) {
+                val preparedBgFile: File? = if (needsFiller && backgroundFile != null) {
                     val bgCrop = zoomPanToCropRect(bgZoom, bgPanX, bgPanY)
                     if (bgCrop.isNonTrivial) {
                         val bgTotal = withContext(Dispatchers.IO) { hardwareEngine.probeDurationSeconds(backgroundFile).coerceAtLeast(1.0) }
@@ -681,27 +679,35 @@ fun YouCutStudioScreen(
                         backgroundFile
                     }
                 } else {
-                    flatPrimary
+                    null
                 }
 
                 renderStatusLabel = "👁 Проверка лиц и шва 50/50..."
-                val framingPlan = if (enableSmartFaceAndSeamCrop) {
-                    faceHelper.analyzeAndBuildFramingPlan(
+                val detectedHardsub = if (oldSubRemovalMode != ExistingSubtitleRemovalMode.OFF) {
+                    faceHelper.detectBurnedInSubtitleRegion(
                         videoFile = flatPrimary,
-                        durationSeconds = targetDur,
-                        oldSubRemovalMode = oldSubRemovalMode
+                        startSec = 0.0,
+                        durationSec = targetDur
                     )
                 } else {
-                    faceHelper.buildFallbackCenterPlan(flatPrimary)
+                    null
                 }
+                val framingPlan = faceHelper.computeFramingPlan(
+                    videoFile = flatPrimary,
+                    enableSmartFaceCrop = enableSmartFaceAndSeamCrop,
+                    maxSampleSeconds = targetDur.toInt().coerceIn(5, 30),
+                    hardsubRegion = detectedHardsub,
+                    hardsubRemovalMode = oldSubRemovalMode
+                )
 
                 val subCfg = SubtitleLayerConfig(
                     enabled = subtitlesEnabled && editablePhrases.isNotEmpty(),
-                    placementZone = SubtitlePlacementZone.CUSTOM,
-                    customMarginV = subtitleCustomY,
+                    densityMode = SubtitleDensityMode.PUNCH_3_TO_4_WORDS,
+                    placementZone = SubtitlePlacementZone.CUSTOM_XY,
+                    customX = 540,
+                    customY = subtitleCustomY,
                     fontSizePx = subtitleFontSizePx,
-                    syncOffsetMs = subtitleSyncOffsetMs,
-                    densityMode = SubtitleDensityMode.KARAOKE_3_WORDS
+                    syncOffsetMs = subtitleSyncOffsetMs
                 )
 
                 val compiledAss: File? = if (subCfg.enabled) {
@@ -713,8 +719,9 @@ fun YouCutStudioScreen(
                     subtitleTransformer.compileEditablePhrasesToAssFile(
                         phrases = editablePhrases,
                         config = subCfg,
-                        playResX = cw,
-                        playResY = ch
+                        framingPlan = framingPlan,
+                        canvasWidth = cw,
+                        canvasHeight = ch
                     )
                 } else {
                     null
@@ -739,7 +746,7 @@ fun YouCutStudioScreen(
                     enableReplacementMusicBed = replacementMusicFile != null,
                     separatedStems = separatedStems,
                     existingSubtitleRemovalMode = oldSubRemovalMode,
-                    detectedHardsubRegion = framingPlan.detectedHardsubRegion,
+                    detectedHardsubRegion = detectedHardsub,
                     subtitleLayer = subCfg,
                     dspLayer = AntiDetectDspLayerConfig(
                         enabled = antiDetectEnabled,
@@ -755,24 +762,14 @@ fun YouCutStudioScreen(
                 )
 
                 renderStatusLabel = if (isPreview5s) "🎬 Аппаратный рендер 5с..." else "🎬 Финальный рендер FullHD 1080p..."
-                val outMp4 = if (isPreview5s) {
-                    hardwareEngine.renderQuickPreviewSample(
-                        primaryVideoFile = flatPrimary,
-                        clutterClipFile = preparedBgFile,
-                        assSubtitleFile = compiledAss,
-                        framingPlan = framingPlan,
-                        config = renderCfg
-                    )
-                } else {
-                    hardwareEngine.composeModularMaster(
-                        primaryVideoFile = flatPrimary,
-                        clutterClipFile = preparedBgFile,
-                        assSubtitleFile = compiledAss,
-                        framingPlan = framingPlan,
-                        durationSeconds = targetDur,
-                        config = renderCfg
-                    )
-                }
+                val outMp4 = hardwareEngine.renderPipeline(
+                    primaryVideoFile = flatPrimary,
+                    clutterReelFile = preparedBgFile,
+                    framingPlan = framingPlan,
+                    assSubtitleFile = compiledAss,
+                    config = renderCfg,
+                    isPreviewPass = isPreview5s
+                )
 
                 if (isPreview5s) {
                     previewModalVideoFile = outMp4
@@ -838,7 +835,8 @@ fun YouCutStudioScreen(
                                     .fillMaxWidth()
                                     .clickable {
                                         showSourcePickerDialog = false
-                                        onSelectPrimaryFromInbox(item.videoFile, item.title, item.sourceUrl)
+                                        val vf = clutterFilter.getInboxVideoFile(item)
+                                        onSelectPrimaryFromInbox(vf, item.title, item.sourceUrl)
                                     }
                             ) {
                                 Text(
@@ -861,7 +859,7 @@ fun YouCutStudioScreen(
     }
 
     if (showBgPickerDialog) {
-        val poolClips = remember { clutterFilter.listLocalPoolClips() }
+        val poolClips = remember { clutterFilter.listVerifiedPoolClips() }
         AlertDialog(
             onDismissRequest = { showBgPickerDialog = false },
             title = { Text("🕹 Выбери фон-наполнитель (2-я дорожка)", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
@@ -902,7 +900,7 @@ fun YouCutStudioScreen(
                     }
                     if (poolClips.isEmpty()) {
                         Text(
-                            "Список сохранённых фонов пока пуст. Зайди в «🔎 Поиск -> Фоны до СТОПА» и сохрани чистые геймплеи/мыло.",
+                            "Список сохранённых фонов пока пуст. Зайди в «🔎 Поиск -> Фоны-наполнители» и сохрани чистые геймплеи/мыло.",
                             color = Color(0xFF9CA3AF),
                             fontSize = 12.sp
                         )
@@ -1982,7 +1980,11 @@ fun YouCutStudioScreen(
                                         isSplittingStems = true
                                         scope.launch {
                                             try {
-                                                separatedStems = hardwareEngine.separateIntoThreeAudioStems(pf, 0.0, timelineTotalSec)
+                                                separatedStems = hardwareEngine.splitVideoAudioIntoStems(
+                                                    primaryVideoFile = pf,
+                                                    startSec = 0.0,
+                                                    endSec = timelineTotalSec
+                                                )
                                                 stemRoutingMode = AudioStemRoutingMode.VOCAL_PLUS_AMBIENCE_NO_MUSIC
                                                 onShowMessage("✅ Звук разделён на Голос / Интершум / Музыку!")
                                             } catch (e: Exception) {
@@ -2003,7 +2005,15 @@ fun YouCutStudioScreen(
                                         isRunningShazam = true
                                         scope.launch {
                                             try {
-                                                val res = subtitleTransformer.identifyAndMatchMusicViaAiShazam(pf, 0.0, timelineTotalSec.coerceAtMost(35.0))
+                                                val stems = separatedStems ?: hardwareEngine.splitVideoAudioIntoStems(
+                                                    primaryVideoFile = pf,
+                                                    startSec = 0.0,
+                                                    endSec = timelineTotalSec.coerceAtMost(35.0)
+                                                ).also { separatedStems = it }
+                                                val res = subtitleTransformer.analyzeMusicStemAndFindSimilar(
+                                                    musicStemFile = stems.musicHarmonicsFile,
+                                                    videoTitle = primaryTitle
+                                                )
                                                 shazamResult = res
                                                 onShowMessage("🎵 Найдено: ${res.detectedTrackAndGenre}")
                                             } catch (_: Exception) {
@@ -2041,24 +2051,22 @@ fun YouCutStudioScreen(
                                         scope.launch {
                                             try {
                                                 val script = dubScriptText.ifBlank {
-                                                    subtitleTransformer.translateOrRewriteDubScript(
-                                                        videoFile = pf,
-                                                        trimStartSec = 0.0,
-                                                        durationSec = timelineTotalSec,
-                                                        sourceTranscriptHint = editablePhrases.joinToString(" ") { it.joinedText }
+                                                    subtitleTransformer.generateDubbingScriptFromVideo(
+                                                        sourceUrl = primarySourceUrl,
+                                                        localVideoFile = pf,
+                                                        startSec = 0.0,
+                                                        endSec = timelineTotalSec,
+                                                        isolatedVocalStemFile = separatedStems?.vocalsOverlayFile
                                                     )
                                                 }
                                                 dubScriptText = script
-                                                val wav = subtitleTransformer.synthesizeRussianVoiceoverAudio(
+                                                val wav = subtitleTransformer.synthesizeVoiceoverToAudioFile(
                                                     scriptText = script,
-                                                    targetDurationSec = timelineTotalSec,
                                                     voiceProfile = selectedVoiceProfile
                                                 )
-                                                if (wav != null) {
-                                                    generatedVoiceoverFile = wav
-                                                    voiceoverDubMode = VoiceoverDubMode.DUB_VOICEOVER_15PCT_BG
-                                                    onShowMessage("✅ Новая озвучка сгенерирована!")
-                                                }
+                                                generatedVoiceoverFile = wav
+                                                voiceoverDubMode = VoiceoverDubMode.DUB_VOICEOVER_15PCT_BG
+                                                onShowMessage("✅ Новая озвучка сгенерирована!")
                                             } catch (e: Exception) {
                                                 onShowMessage("Ошибка озвучки: ${e.message}")
                                             } finally {

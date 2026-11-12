@@ -24,7 +24,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -202,13 +201,13 @@ private fun PocketMediaForgeRootApp(
         val existingInbox = clutterFilter.listStudioInboxItems()
         if (studioPrimaryFile == null && existingInbox.isNotEmpty()) {
             val first = existingInbox.first()
-            studioPrimaryFile = first.videoFile
+            studioPrimaryFile = clutterFilter.getInboxVideoFile(first)
             studioPrimaryTitle = first.title
             studioPrimaryUrl = first.sourceUrl
             studioRecStartSec = first.recommendedStartSec
             studioRecEndSec = first.recommendedEndSec
         }
-        val existingPool = clutterFilter.listLocalPoolClips()
+        val existingPool = clutterFilter.listVerifiedPoolClips()
         if (studioBgFile == null && existingPool.isNotEmpty()) {
             studioBgFile = existingPool.first()
             studioBgTitle = existingPool.first().nameWithoutExtension
@@ -221,22 +220,20 @@ private fun PocketMediaForgeRootApp(
     ) { uri: Uri? ->
         if (uri != null) {
             scope.launch {
-                val saved = withContext(Dispatchers.IO) {
-                    val inboxDir = File(context.filesDir, "studio_inbox").apply { mkdirs() }
-                    val out = File(inboxDir, "phone_src_${System.currentTimeMillis()}.mp4")
-                    context.contentResolver.openInputStream(uri)?.use { input ->
-                        out.outputStream().use { output -> input.copyTo(output) }
+                try {
+                    val item = clutterFilter.importLocalUriToInbox(uri)
+                    val saved = clutterFilter.getInboxVideoFile(item)
+                    if (saved.exists()) {
+                        studioPrimaryFile = saved
+                        studioPrimaryTitle = item.title
+                        studioPrimaryUrl = item.sourceUrl
+                        studioRecStartSec = 0.0
+                        studioRecEndSec = 0.0
+                        currentTab = MainBottomTab.STUDIO
+                        showToastMsg("🎬 Видео открыто на 1-й дорожке YouCut!")
                     }
-                    if (out.exists() && out.length() > 1024L) out else null
-                }
-                if (saved != null) {
-                    studioPrimaryFile = saved
-                    studioPrimaryTitle = saved.nameWithoutExtension
-                    studioPrimaryUrl = ""
-                    studioRecStartSec = 0.0
-                    studioRecEndSec = 0.0
-                    currentTab = MainBottomTab.STUDIO
-                    showToastMsg("🎬 Видео открыто на 1-й дорожке YouCut!")
+                } catch (e: Exception) {
+                    showToastMsg("❌ Ошибка импорта видео: ${e.message}")
                 }
             }
         }
@@ -247,19 +244,16 @@ private fun PocketMediaForgeRootApp(
     ) { uri: Uri? ->
         if (uri != null) {
             scope.launch {
-                val saved = withContext(Dispatchers.IO) {
-                    val poolDir = clutterFilter.getPoolDir()
-                    val out = File(poolDir, "filler_${System.currentTimeMillis()}.mp4")
-                    context.contentResolver.openInputStream(uri)?.use { input ->
-                        out.outputStream().use { output -> input.copyTo(output) }
+                try {
+                    val saved = clutterFilter.importLocalUriToPool(uri)
+                    if (saved.exists()) {
+                        studioBgFile = saved
+                        studioBgTitle = saved.nameWithoutExtension
+                        currentTab = MainBottomTab.STUDIO
+                        showToastMsg("🕹 Фон добавлен на 2-ю дорожку YouCut!")
                     }
-                    if (out.exists() && out.length() > 1024L) out else null
-                }
-                if (saved != null) {
-                    studioBgFile = saved
-                    studioBgTitle = saved.nameWithoutExtension
-                    currentTab = MainBottomTab.STUDIO
-                    showToastMsg("🕹 Фон добавлен на 2-ю дорожку YouCut!")
+                } catch (e: Exception) {
+                    showToastMsg("❌ Ошибка добавления фона: ${e.message}")
                 }
             }
         }
@@ -336,7 +330,7 @@ private fun PocketMediaForgeRootApp(
                             studioRecStartSec = sSec
                             studioRecEndSec = eSec
                             currentTab = MainBottomTab.STUDIO
-                            showToastMsg("🎬 Ролик загружен на 1-ю дорожку Студии YouCut!")
+                            showToastMsg("🎬 Ролик загружен на 1-й дорожке Студии YouCut!")
                         },
                         onLoadBackgroundIntoStudio = { file, title ->
                             studioBgFile = file
@@ -636,13 +630,22 @@ private fun SearchAndLibraryHubScreen(
                                 if (u.startsWith("http")) {
                                     downloadingCardId = "direct_url"
                                     scope.launch {
-                                        val saved = clutterFilter.downloadSourceForManualStudio(u, "Ручная ссылка")
-                                        downloadingCardId = null
-                                        if (saved != null) {
-                                            directUrlInput = ""
-                                            onLoadSourceIntoStudio(saved.videoFile, saved.title, saved.sourceUrl, 0.0, 0.0)
-                                        } else {
-                                            onShowMessage("❌ Не удалось скачать видео по ссылке")
+                                        try {
+                                            val saved = clutterFilter.downloadSourceToStudioInbox(
+                                                sourceUrl = u,
+                                                overrideTitle = "Ручная ссылка"
+                                            )
+                                            val vf = clutterFilter.getInboxVideoFile(saved)
+                                            downloadingCardId = null
+                                            if (vf.exists()) {
+                                                directUrlInput = ""
+                                                onLoadSourceIntoStudio(vf, saved.title, saved.sourceUrl, 0.0, 0.0)
+                                            } else {
+                                                onShowMessage("❌ Не удалось скачать видео по ссылке")
+                                            }
+                                        } catch (e: Exception) {
+                                            downloadingCardId = null
+                                            onShowMessage("❌ Ошибка загрузки: ${e.message}")
                                         }
                                     }
                                 }
@@ -667,15 +670,23 @@ private fun SearchAndLibraryHubScreen(
                         downloadingCardId = cand.id
                         onShowMessage("📥 Скачиваю ролик в Студию YouCut...")
                         scope.launch {
-                            val saved = clutterFilter.downloadSourceForManualStudio(
-                                sourceUrl = cand.url,
-                                suggestedTitle = cand.title
-                            )
-                            downloadingCardId = null
-                            if (saved != null) {
-                                onLoadSourceIntoStudio(saved.videoFile, saved.title, saved.sourceUrl, 0.0, 0.0)
-                            } else {
-                                onShowMessage("❌ Ошибка скачивания ролика")
+                            try {
+                                val saved = clutterFilter.downloadSourceToStudioInbox(
+                                    sourceUrl = cand.url,
+                                    overrideTitle = cand.title,
+                                    overrideAuthor = cand.author,
+                                    aiSummary = cand.aiWhatsInside
+                                )
+                                val vf = clutterFilter.getInboxVideoFile(saved)
+                                downloadingCardId = null
+                                if (vf.exists()) {
+                                    onLoadSourceIntoStudio(vf, saved.title, saved.sourceUrl, 0.0, 0.0)
+                                } else {
+                                    onShowMessage("❌ Ошибка скачивания ролика")
+                                }
+                            } catch (e: Exception) {
+                                downloadingCardId = null
+                                onShowMessage("❌ Ошибка скачивания: ${e.message}")
                             }
                         }
                     },
@@ -792,15 +803,21 @@ private fun SearchAndLibraryHubScreen(
                         downloadingCardId = cand.id
                         onShowMessage("📥 Скачиваю чистый фон в твой пул...")
                         scope.launch {
-                            val clip = clutterFilter.downloadAndValidateCandidateUrl(
-                                videoUrl = cand.url,
-                                labelPrefix = cand.title.take(18)
-                            )
-                            downloadingCardId = null
-                            if (clip != null) {
-                                onLoadBackgroundIntoStudio(clip, cand.title)
-                            } else {
-                                onShowMessage("❌ Фон не прошёл фильтр плавности или недоступен")
+                            try {
+                                val clip = clutterFilter.downloadUrlToPoolWithTags(
+                                    sourceUrl = cand.url,
+                                    rawTagsInput = bgQuery,
+                                    customTitle = cand.title.take(60)
+                                )
+                                downloadingCardId = null
+                                if (clip.exists()) {
+                                    onLoadBackgroundIntoStudio(clip, cand.title)
+                                } else {
+                                    onShowMessage("❌ Фон недоступен")
+                                }
+                            } catch (e: Exception) {
+                                downloadingCardId = null
+                                onShowMessage("❌ Ошибка скачивания фона: ${e.message}")
                             }
                         }
                     },
@@ -944,7 +961,7 @@ private fun SettingsAndLogScreen(
     val bannedVideos by SearchBlacklistStore.bannedVideoKeys.collectAsState()
     val seenCount by SearchBlacklistStore.seenCount.collectAsState()
     val logLines by DiagnosticLogger.logFlow.collectAsState()
-    val svcStatus by PipelineForegroundService.serviceStateFlow.collectAsState()
+    val svcStatus by PipelineForegroundService.statusFlow.collectAsState()
 
     Column(
         modifier = Modifier
