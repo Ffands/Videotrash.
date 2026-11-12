@@ -16,9 +16,12 @@ import forge.media.pocket.vision.UpperBoxFramingPlan
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
 import java.io.File
 import java.util.Locale
+import java.util.UUID
 import kotlin.coroutines.resume
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.random.Random
 
@@ -72,12 +75,28 @@ enum class WatermarkEraseMethod(val label: String) {
 /**
  * Интерактивная зона удаления вотермарки / логотипа / вшитых субтитров в нормализованных координатах [0..1] выходного холста.
  */
+@Serializable
 data class WatermarkMaskBox(
     val xNorm: Float,
     val yNorm: Float,
     val wNorm: Float,
     val hNorm: Float
 )
+
+/**
+ * Сегмент мульти-разрезки таймлайна в Цехе 1 («Первичная Разделка»).
+ * Пользователь может разрезать ролик в любых точках и выкинуть лишние куски (`kept = false`).
+ */
+@Serializable
+data class ClipTimeSegment(
+    val id: String = UUID.randomUUID().toString().take(8),
+    val startSec: Double,
+    val endSec: Double,
+    val kept: Boolean = true
+) {
+    val durationSec: Double
+        get() = (endSec - startSec).coerceAtLeast(0.0)
+}
 
 enum class MusicRemovalMode(val label: String) {
     OFF("Выкл (Оригинальный звук)"),
@@ -242,6 +261,243 @@ class FFmpegHardwareEngine(private val context: Context) {
             )
             targetFile
         }
+
+    fun hasAudioTrack(videoFile: File): Boolean {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(videoFile.absolutePath)
+            val hasAudio = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO)
+            hasAudio.equals("yes", ignoreCase = true) || hasAudio == "true"
+        } catch (_: Exception) {
+            true
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * Цех 1 («Первичная Разделка»): Склеивает все оставленные куски (`kept = true`),
+     * применяет ручной свободный кроп, затирку вотермарок (`delogo`/блюр/плашка) и скорость,
+     * выдавая чистый подготовленный MP4, готовый к загрузке в Главный Редактор-Сборщик (или сохранению в Галерею)!
+     */
+    suspend fun bakePreparedClip(
+        inputFile: File,
+        segments: List<ClipTimeSegment>,
+        manualCrop: ManualCropRect,
+        watermarkBoxes: List<WatermarkMaskBox>,
+        eraseMethod: WatermarkEraseMethod,
+        playbackSpeed: Float = 1.0f,
+        outputDir: File? = null,
+        prefix: String = "prepared"
+    ): File = withContext(Dispatchers.IO) {
+        if (!inputFile.exists() || inputFile.length() < 1000L) {
+            throw IllegalStateException("Исходный видеофайл не найден (${inputFile.name})")
+        }
+
+        val totalDur = probeDurationSeconds(inputFile).coerceAtLeast(0.5)
+        val kept = segments
+            .filter { it.kept && it.endSec > it.startSec + 0.15 }
+            .map {
+                it.copy(
+                    startSec = it.startSec.coerceIn(0.0, (totalDur - 0.1).coerceAtLeast(0.0)),
+                    endSec = it.endSec.coerceIn(0.15, totalDur)
+                )
+            }
+            .filter { it.endSec > it.startSec + 0.12 }
+
+        if (kept.isEmpty()) {
+            throw IllegalArgumentException("Все куски на таймлайне удалены! Оставьте хотя бы один фрагмент.")
+        }
+
+        val targetDir = (outputDir ?: stagingDir).apply { mkdirs() }
+        val outFile = File(targetDir, "${prefix}_${System.currentTimeMillis()}.mp4")
+        val speed = playbackSpeed.coerceIn(0.5f, 2.0f)
+
+        // Zero-reencode fast path when user didn't cut, crop, mask, or speed-shift the clip
+        val isUntouchedFullClip = kept.size == 1 &&
+            kept[0].startSec <= 0.12 &&
+            kept[0].endSec >= (totalDur - 0.25) &&
+            !manualCrop.isNonTrivial &&
+            watermarkBoxes.isEmpty() &&
+            abs(speed - 1.0f) < 0.02f
+
+        if (isUntouchedFullClip) {
+            inputFile.copyTo(outFile, overwrite = true)
+            DiagnosticLogger.log("PRE-EDITOR", "⚡ Без перекодирования: клип передан в Сборщик как есть (${outFile.length() / 1024} KB)")
+            return@withContext outFile
+        }
+
+        val (srcW, srcH) = probeVideoDimensions(inputFile)
+        val hasAudio = hasAudioTrack(inputFile)
+
+        // Compute cropped canvas dimensions (even numbers)
+        val cx = if (manualCrop.isNonTrivial) ((manualCrop.leftNorm.coerceIn(0f, 0.85f) * srcW).roundToInt()).let { it - (it % 2) } else 0
+        val cy = if (manualCrop.isNonTrivial) ((manualCrop.topNorm.coerceIn(0f, 0.85f) * srcH).roundToInt()).let { it - (it % 2) } else 0
+        val cw = if (manualCrop.isNonTrivial) {
+            (((manualCrop.rightNorm - manualCrop.leftNorm).coerceIn(0.12f, 1.0f) * srcW).roundToInt())
+                .coerceIn(64, (srcW - cx).coerceAtLeast(64))
+                .let { it - (it % 2) }
+        } else {
+            srcW - (srcW % 2)
+        }
+        val ch = if (manualCrop.isNonTrivial) {
+            (((manualCrop.bottomNorm - manualCrop.topNorm).coerceIn(0.12f, 1.0f) * srcH).roundToInt())
+                .coerceIn(64, (srcH - cy).coerceAtLeast(64))
+                .let { it - (it % 2) }
+        } else {
+            srcH - (srcH % 2)
+        }
+
+        fun buildBakeCmd(useHw: Boolean): String {
+            val stages = mutableListOf<String>()
+
+            if (kept.size == 1) {
+                val seg = kept[0]
+                stages.add(
+                    String.format(
+                        Locale.US,
+                        "[0:v:0]trim=start=%.3f:end=%.3f,setpts=PTS-STARTPTS[v_cat]",
+                        seg.startSec,
+                        seg.endSec
+                    )
+                )
+                if (hasAudio) {
+                    stages.add(
+                        String.format(
+                            Locale.US,
+                            "[0:a:0]atrim=start=%.3f:end=%.3f,asetpts=PTS-STARTPTS[a_cat]",
+                            seg.startSec,
+                            seg.endSec
+                        )
+                    )
+                }
+            } else {
+                val concatInputs = StringBuilder()
+                kept.forEachIndexed { idx, seg ->
+                    stages.add(
+                        String.format(
+                            Locale.US,
+                            "[0:v:0]trim=start=%.3f:end=%.3f,setpts=PTS-STARTPTS[vs%d]",
+                            seg.startSec,
+                            seg.endSec,
+                            idx
+                        )
+                    )
+                    concatInputs.append("[vs$idx]")
+                    if (hasAudio) {
+                        stages.add(
+                            String.format(
+                                Locale.US,
+                                "[0:a:0]atrim=start=%.3f:end=%.3f,asetpts=PTS-STARTPTS[as%d]",
+                                seg.startSec,
+                                seg.endSec,
+                                idx
+                            )
+                        )
+                        concatInputs.append("[as$idx]")
+                    }
+                }
+                if (hasAudio) {
+                    stages.add("${concatInputs}concat=n=${kept.size}:v=1:a=1[v_cat][a_cat]")
+                } else {
+                    stages.add("${concatInputs}concat=n=${kept.size}:v=1:a=0[v_cat]")
+                }
+            }
+
+            var curV = "[v_cat]"
+            val postV = mutableListOf<String>()
+            if (abs(speed - 1.0f) >= 0.02f) {
+                postV.add(String.format(Locale.US, "setpts=PTS/%.4f", speed))
+            }
+            postV.add("fps=30")
+            if (manualCrop.isNonTrivial) {
+                postV.add("crop=$cw:$ch:$cx:$cy")
+            }
+            postV.add("setsar=1")
+            stages.add("$curV${postV.joinToString(",")}[v_cropped]")
+            curV = "[v_cropped]"
+
+            watermarkBoxes.forEachIndexed { idx, box ->
+                val wx = (box.xNorm * cw).roundToInt().coerceIn(4, (cw - 32).coerceAtLeast(4))
+                val wy = (box.yNorm * ch).roundToInt().coerceIn(4, (ch - 32).coerceAtLeast(4))
+                val ww = (box.wNorm * cw).roundToInt().coerceIn(20, (cw - 4 - wx).coerceAtLeast(20))
+                val wh = (box.hNorm * ch).roundToInt().coerceIn(20, (ch - 4 - wy).coerceAtLeast(20))
+                val nextV = "[v_wm_$idx]"
+                when (eraseMethod) {
+                    WatermarkEraseMethod.DELOGO_INPAINT -> {
+                        stages.add("${curV}delogo=x=$wx:y=$wy:w=$ww:h=$wh:show=0$nextV")
+                    }
+                    WatermarkEraseMethod.GAUSSIAN_BLUR -> {
+                        stages.add(
+                            "${curV}split=2[wmb_$idx][wmc_$idx];" +
+                                "[wmc_$idx]crop=$ww:$wh:$wx:$wy,gblur=sigma=22[wmbl_$idx];" +
+                                "[wmb_$idx][wmbl_$idx]overlay=$wx:$wy$nextV"
+                        )
+                    }
+                    WatermarkEraseMethod.DARK_MATTE_BOX -> {
+                        stages.add("${curV}drawbox=x=$wx:y=$wy:w=$ww:h=$wh:color=#09090B@0.94:t=fill$nextV")
+                    }
+                }
+                curV = nextV
+            }
+
+            val pixFmt = if (useHw) "nv12" else "yuv420p"
+            stages.add("${curV}format=$pixFmt[v_out]")
+
+            if (hasAudio) {
+                val aChain = mutableListOf("aresample=48000", "aformat=sample_fmts=fltp:channel_layouts=stereo")
+                if (abs(speed - 1.0f) >= 0.02f) {
+                    aChain.add(String.format(Locale.US, "atempo=%.4f", speed))
+                }
+                stages.add("[a_cat]${aChain.joinToString(",")}[a_out]")
+            } else {
+                // Inject silent stereo track so downstream Main Assembler & Whisper never fail on muted clips!
+                val totalKeptOutSec = (kept.sumOf { it.durationSec } / speed.toDouble()).coerceAtLeast(1.0)
+                stages.add(
+                    String.format(
+                        Locale.US,
+                        "aevalsrc=0:c=stereo:s=48000:d=%.2f[a_out]",
+                        totalKeptOutSec
+                    )
+                )
+            }
+
+            val fc = stages.joinToString(";")
+            return buildString {
+                append("-hide_banner -loglevel warning -nostdin -y ")
+                append("-i \"${inputFile.absolutePath}\" ")
+                append("-filter_complex \"$fc\" ")
+                append("-map \"[v_out]\" -map \"[a_out]\" ")
+                if (useHw) {
+                    append("-c:v h264_mediacodec -b:v 14000k ")
+                } else {
+                    append("-c:v libx264 -preset superfast -crf 18 ")
+                }
+                append("-c:a aac -b:a 192k -ar 48000 -movflags +faststart ")
+                append("\"${outFile.absolutePath}\"")
+            }
+        }
+
+        DiagnosticLogger.log(
+            "PRE-EDITOR",
+            "✂️ Сборка разделанного клипа: кусков=${kept.size}, кроп=${manualCrop.isNonTrivial}, вотермарок=${watermarkBoxes.size}, скорость=${speed}x"
+        )
+
+        if (executeFFmpegCommand(buildBakeCmd(useHw = true)) && outFile.exists() && outFile.length() > 8_000L) {
+            DiagnosticLogger.log("PRE-EDITOR", "✅ Клип подготовлен аппаратно: ${outFile.name} (${outFile.length() / 1024} KB)")
+            return@withContext outFile
+        }
+
+        outFile.delete()
+        if (!executeFFmpegCommand(buildBakeCmd(useHw = false)) || !outFile.exists() || outFile.length() == 0L) {
+            throw IllegalStateException("Ошибка первичной разделки FFmpeg — проверьте границы кусков и кропа.")
+        }
+        DiagnosticLogger.log("PRE-EDITOR", "✅ Клип подготовлен программно: ${outFile.name} (${outFile.length() / 1024} KB)")
+        outFile
+    }
 
     suspend fun renderPipeline(
         primaryVideoFile: File,
@@ -775,6 +1031,16 @@ class FFmpegHardwareEngine(private val context: Context) {
             )
             filterStages.add("$currentAudioLabel[a_bgm_new]amix=inputs=2:duration=first:dropout_transition=0[a_with_bgm]")
             currentAudioLabel = "[a_with_bgm]"
+        }
+
+        val bgVol = config.bgVolume.coerceIn(0.0f, 1.5f)
+        if (clutterInputIndex >= 0 && bgVol > 0.02f && clutterReelFile != null && hasAudioTrack(clutterReelFile)) {
+            filterStages.add(
+                "[$clutterInputIndex:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo," +
+                    "volume=${String.format(Locale.US, "%.2f", bgVol)}[a_clutter_bg]"
+            )
+            filterStages.add("$currentAudioLabel[a_clutter_bg]amix=inputs=2:duration=first:dropout_transition=0[a_with_clutter]")
+            currentAudioLabel = "[a_with_clutter]"
         }
 
         if (config.adLayer.mode == AdInsertionMode.BANNER_OVERLAY) {

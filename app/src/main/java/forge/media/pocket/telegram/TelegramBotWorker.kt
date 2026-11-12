@@ -12,6 +12,7 @@ import forge.media.pocket.discovery.ContentSortOrder
 import forge.media.pocket.discovery.DiscoveredMediaCandidate
 import forge.media.pocket.discovery.DiscoveredSpamChannel
 import forge.media.pocket.discovery.HuntPlatform
+import forge.media.pocket.discovery.SearchBlacklistStore
 import forge.media.pocket.discovery.SearchDurationMode
 import forge.media.pocket.discovery.SearchLanguageMode
 import forge.media.pocket.discovery.SearchTimePeriod
@@ -59,7 +60,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 data class PendingHuntFilterState(
     val queryTags: String,
-    var platform: HuntPlatform = HuntPlatform.YOUTUBE,
+    var platform: HuntPlatform = HuntPlatform.ALL,
     var sortOrder: ContentSortOrder = ContentSortOrder.POPULAR,
     var period: SearchTimePeriod = SearchTimePeriod.MONTH,
     var durationMode: SearchDurationMode = SearchDurationMode.ANY_UP_TO_6M,
@@ -266,8 +267,6 @@ class TelegramBotWorker(
             return
         }
         if (!isPolling.compareAndSet(false, true)) return
-
-        clutterFilter.triggerBackgroundPoolWarmupIfNeeded()
 
         pollingJob = scope.launch(Dispatchers.IO) {
             DiagnosticLogger.log("TELEGRAM", "Запущен цикл Long-Polling Telegram API")
@@ -645,7 +644,7 @@ class TelegramBotWorker(
                     btn("🎬 Найти фоны ($poolSize)", "bg_menu:0")
                 ),
                 listOf(
-                    btn("🔄 Авто-докачка фонов", "pool_warmup:0"),
+                    btn("🗂 Мои фоны ($poolSize)", "bg_list:0"),
                     btn("📜 Открыть лог", "log_refresh:0")
                 )
             )
@@ -822,15 +821,10 @@ class TelegramBotWorker(
                         val num = idx + 1
                         val durStr = formatDurationMmSs(c.durationSec)
                         val viewsStr = formatViewsCount(c.viewOrScoreCount)
-                        val platIcon = when (c.platform) {
-                            HuntPlatform.YOUTUBE -> "▶️ YT"
-                            HuntPlatform.RUTUBE -> "📺 Rutube"
-                            HuntPlatform.REDDIT -> "👽 Reddit"
-                            HuntPlatform.ALL -> "🌐"
-                        }
+                        val platIcon = c.platform.badge
                         val agePart = if (c.publishedAgeLabel.isNotBlank()) " • 📅 ${c.publishedAgeLabel}" else ""
                         append("$num. [$platIcon] ${c.title}\n")
-                        append("   ⏱ $durStr • 👁 $viewsStr просм.$agePart • 👤 ${c.author}\n")
+                        append("   ⏱ $durStr • 👁 $viewsStr$agePart • 👤 ${c.author}\n")
                         if (c.cloutStatusLabel.isNotBlank()) {
                             append("   📊 ${c.cloutStatusLabel}\n")
                         }
@@ -846,8 +840,9 @@ class TelegramBotWorker(
                     val num = idx + 1
                     buttonRows.add(
                         listOf(
-                            btn("🧠 Что внутри #$num", "inside_one:${batchId}_$idx"),
-                            btn("✅ Взять #$num (1080p)", "take_one:${batchId}_$idx")
+                            btn("🧠 Внутри #$num", "inside_one:${batchId}_$idx"),
+                            btn("✅ Взять #$num", "take_one:${batchId}_$idx"),
+                            btn("🚫 Бан канал", "ban_ch:${batchId}_$idx")
                         )
                     )
                 }
@@ -1167,12 +1162,16 @@ class TelegramBotWorker(
                 }
                 return
             }
-            "pool_warmup" -> {
-                clutterFilter.triggerBackgroundPoolWarmupIfNeeded(forceAddMore = true)
-                sendMessage(
-                    chatId,
-                    "🔄 Запущена авто-докачка фонов в пул! Или нажми «🎬 Поиск фонов / Залипалок», чтобы выбрать фоны вручную."
-                )
+            "ban_ch" -> {
+                val idx = targetId.substringAfterLast("_").toIntOrNull() ?: return
+                val batchId = targetId.substringBeforeLast("_")
+                val list = discoveredBatches[batchId]
+                if (list != null && idx in list.indices) {
+                    val c = list[idx]
+                    SearchBlacklistStore.banChannel(context, c.author)
+                    SearchBlacklistStore.banVideo(context, c.id, c.url, c.title)
+                    sendMessage(chatId, "🚫 Канал «${c.author}» и ролик добавлены в чёрный список!")
+                }
                 return
             }
             "bg_menu" -> {
@@ -1601,10 +1600,9 @@ class TelegramBotWorker(
                 }
                 "hunt_cnt" -> {
                     filterState.count = when (filterState.count) {
-                        4 -> 6
-                        6 -> 10
-                        10 -> 15
-                        else -> 4
+                        10 -> 20
+                        20 -> 30
+                        else -> 10
                     }
                     sendOrEditHuntConfigurator(chatId, messageId, targetId, filterState)
                 }

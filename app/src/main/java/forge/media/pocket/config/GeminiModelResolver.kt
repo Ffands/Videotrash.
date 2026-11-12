@@ -20,7 +20,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -29,6 +28,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
+import java.util.concurrent.ConcurrentHashMap
 
 object GeminiModelResolver {
 
@@ -66,33 +66,39 @@ object GeminiModelResolver {
     private var cachedTtsModels: List<String> = emptyList()
     private var cachedAtMs: Long = 0L
 
+    /**
+     * Tracks models that returned HTTP 404 or "no longer available to new users" during this session
+     * so we never waste latency retrying a retired model (e.g., gemini-2.5-flash on newer keys).
+     */
+    private val deadModels = ConcurrentHashMap.newKeySet<String>()
+
     private val defaultFallbackTextModels = listOf(
-        "gemini-2.5-flash",
-        "gemini-flash-latest",
-        "gemini-2.0-flash",
-        "gemini-2.5-flash-lite",
         "gemini-3-flash-preview",
-        "gemini-3.8-flash"
+        "gemini-flash-latest",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash"
     )
 
     private val defaultFallbackTtsModels = listOf(
         "gemini-2.5-flash-preview-tts",
-        "gemini-2.5-pro-preview-tts",
-        "gemini-3.8-flash-lite-tts"
+        "gemini-2.5-pro-preview-tts"
     )
 
     suspend fun resolveTextAndMultimodalModels(apiKey: String): List<String> = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank()) return@withContext emptyList()
         ensureDiscovered(cleanKey)
-        cachedTextModels.ifEmpty { defaultFallbackTextModels }
+        val candidates = cachedTextModels.ifEmpty { defaultFallbackTextModels }
+        val alive = candidates.filter { it !in deadModels }
+        alive.ifEmpty { defaultFallbackTextModels.filter { it !in deadModels } }
     }
 
     suspend fun resolveTtsModels(apiKey: String): List<String> = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank()) return@withContext emptyList()
         ensureDiscovered(cleanKey)
-        cachedTtsModels.ifEmpty { defaultFallbackTtsModels }
+        cachedTtsModels.ifEmpty { defaultFallbackTtsModels }.filter { it !in deadModels }
     }
 
     private suspend fun ensureDiscovered(cleanKey: String) {
@@ -117,7 +123,7 @@ object GeminiModelResolver {
                 val genModels = parsed.models
                     .filter { "generateContent" in it.supportedGenerationMethods }
                     .map { it.name.removePrefix("models/") }
-                    .filter { it.startsWith("gemini", ignoreCase = true) }
+                    .filter { it.startsWith("gemini", ignoreCase = true) && it !in deadModels }
 
                 val ttsFound = genModels.filter { it.contains("tts", ignoreCase = true) }
 
@@ -138,25 +144,25 @@ object GeminiModelResolver {
                 val rankedText = textCandidates.sortedBy { m ->
                     val low = m.lowercase()
                     when {
-                        low == "gemini-2.5-flash" -> 1
-                        low == "gemini-3-flash-preview" || low == "gemini-3.8-flash" -> 2
-                        low == "gemini-flash-latest" -> 3
-                        low == "gemini-2.5-flash-lite" -> 4
-                        low == "gemini-2.0-flash" -> 5
+                        low == "gemini-3-flash-preview" || low == "gemini-3.1-flash-preview" -> 1
+                        low == "gemini-flash-latest" -> 2
+                        low == "gemini-2.5-flash-lite" -> 3
+                        low == "gemini-2.0-flash" -> 4
+                        low == "gemini-2.5-flash" -> 5
                         low.contains("flash") && !low.contains("lite") && !low.contains("8b") -> 6
                         low.contains("flash") -> 7
                         low.contains("pro") -> 8
                         else -> 9
                     }
-                }.take(5)
+                }.take(6)
 
                 cachedKeyFingerprint = fp
                 cachedTextModels = if (rankedText.isNotEmpty()) rankedText else defaultFallbackTextModels
-                cachedTtsModels = if (ttsFound.isNotEmpty()) ttsFound + defaultFallbackTtsModels else defaultFallbackTtsModels
+                cachedTtsModels = if (ttsFound.isNotEmpty()) (ttsFound + defaultFallbackTtsModels).distinct() else defaultFallbackTtsModels
                 cachedAtMs = now
                 DiagnosticLogger.log(
                     "GEMINI-MODELS",
-                    "✅ Ключ Gemini проверен. Доступные рабочие модели: ${cachedTextModels.joinToString(", ")}"
+                    "✅ Ключ Gemini проверен. Приоритет моделей: ${cachedTextModels.joinToString(", ")}"
                 )
             } catch (e: Exception) {
                 DiagnosticLogger.log("GEMINI-MODELS", "Предупреждение авто-определения моделей: ${e.message?.take(80)}")
@@ -218,6 +224,7 @@ object GeminiModelResolver {
         val payloadString = requestJson.toString()
 
         for (modelName in models) {
+            if (modelName in deadModels) continue
             try {
                 val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$cleanKey"
                 val httpResp = httpClient.post(endpoint) {
@@ -226,10 +233,22 @@ object GeminiModelResolver {
                 }
                 val rawBody = httpResp.bodyAsText()
                 if (!httpResp.status.isSuccess()) {
-                    DiagnosticLogger.log(
-                        "AI-CALL",
-                        "Gemini [$modelName] HTTP ${httpResp.status.value}: ${rawBody.take(120).replace("\n", " ")}"
-                    )
+                    val code = httpResp.status.value
+                    if (code == 404 ||
+                        (code == 400 && (
+                            rawBody.contains("no longer available", ignoreCase = true) ||
+                                rawBody.contains("not found", ignoreCase = true) ||
+                                rawBody.contains("not supported", ignoreCase = true)
+                            ))
+                    ) {
+                        deadModels.add(modelName)
+                        DiagnosticLogger.log("AI-CALL", "Модель [$modelName] отключена Google (HTTP $code) -> помечена в чёрный список сессии")
+                    } else {
+                        DiagnosticLogger.log(
+                            "AI-CALL",
+                            "Gemini [$modelName] HTTP $code: ${rawBody.take(120).replace("\n", " ")}"
+                        )
+                    }
                     continue
                 }
 

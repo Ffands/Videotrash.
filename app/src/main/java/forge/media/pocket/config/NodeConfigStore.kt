@@ -109,6 +109,7 @@ class NodeConfigStore(private val context: Context) {
         private const val PREFS_NAME = "pocket_media_forge_node_prefs"
         private const val KEY_BOT_TOKEN = "telegram_bot_token"
         private const val KEY_GEMINI_API_KEY = "gemini_api_key"
+        private const val KEY_GROQ_API_KEY = "groq_api_key"
         private const val KEY_ALLOWED_CHAT_ID = "allowed_chat_id"
     }
 
@@ -130,6 +131,15 @@ class NodeConfigStore(private val context: Context) {
 
     fun setGeminiApiKey(key: String) {
         prefs.edit().putString(KEY_GEMINI_API_KEY, key.trim()).apply()
+    }
+
+    fun getGroqApiKey(): String {
+        val local = prefs.getString(KEY_GROQ_API_KEY, null)?.trim()
+        return if (!local.isNullOrEmpty()) local else BuildConfig.DEFAULT_GROQ_API_KEY.trim()
+    }
+
+    fun setGroqApiKey(key: String) {
+        prefs.edit().putString(KEY_GROQ_API_KEY, key.trim()).apply()
     }
 
     fun getAllowedChatId(): String {

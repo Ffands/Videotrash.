@@ -21,13 +21,16 @@ import pipelineServiceRaw from '../app/src/main/java/forge/media/pocket/service/
 import faceCenteringRaw from '../app/src/main/java/forge/media/pocket/vision/FaceCenteringHelper.kt?raw';
 import clutterFilterRaw from '../app/src/main/java/forge/media/pocket/clutter/ClutterEntropyFilter.kt?raw';
 import topicHunterRaw from '../app/src/main/java/forge/media/pocket/discovery/TopicHunterEngine.kt?raw';
+import searchBlacklistRaw from '../app/src/main/java/forge/media/pocket/discovery/SearchBlacklistStore.kt?raw';
+import backgroundCrawlerRaw from '../app/src/main/java/forge/media/pocket/discovery/BackgroundCrawlerManager.kt?raw';
 import subtitleTransformerRaw from '../app/src/main/java/forge/media/pocket/subtitles/SubtitleAssTransformer.kt?raw';
 import ffmpegEngineRaw from '../app/src/main/java/forge/media/pocket/compositor/FFmpegHardwareEngine.kt?raw';
 import geminiClientRaw from '../app/src/main/java/forge/media/pocket/telegram/GeminiMetadataClient.kt?raw';
 import telegramWorkerRaw from '../app/src/main/java/forge/media/pocket/telegram/TelegramBotWorker.kt?raw';
 import nodeConfigStoreRaw from '../app/src/main/java/forge/media/pocket/config/NodeConfigStore.kt?raw';
 import geminiModelResolverRaw from '../app/src/main/java/forge/media/pocket/config/GeminiModelResolver.kt?raw';
-import studioCanvasOverlayRaw from '../app/src/main/java/forge/media/pocket/ui/StudioCanvasOverlayView.kt?raw';
+import preEditorWorkbenchRaw from '../app/src/main/java/forge/media/pocket/ui/PreEditorWorkbenchScreen.kt?raw';
+import forgeAssemblerRaw from '../app/src/main/java/forge/media/pocket/ui/ForgeAssemblerScreen.kt?raw';
 import mainActivityRaw from '../app/src/main/java/forge/media/pocket/ui/MainActivity.kt?raw';
 
 interface ProjectFile {
@@ -57,21 +60,21 @@ const PROJECT_FILES: ProjectFile[] = [
     step: 1,
     path: 'build.gradle.kts',
     language: 'kotlin',
-    description: 'Top-level Gradle configuration (AGP 8.7.2, Kotlin 2.0.21, Serialization).',
+    description: 'Top-level Gradle configuration (AGP 8.5.2, Kotlin 1.9.24, Serialization).',
     content: rootBuildGradleRaw,
   },
   {
     step: 1,
     path: 'app/build.gradle.kts',
     language: 'kotlin',
-    description: 'Hybrid 6C config: reads optional GitHub Secrets into BuildConfig defaults + on-device override.',
+    description: 'Compose BOM 2024.06.00, AndroidX Media3 ExoPlayer 1.3.1, Coil, FFmpegKit, yt-dlp, and Groq/Gemini/TG BuildConfig.',
     content: appBuildGradleRaw,
   },
   {
     step: 1,
     path: 'app/proguard-rules.pro',
     language: 'properties',
-    description: 'Keep rules for FFmpegKit JNI, YoutubeDL-Android, Google ML Kit, and Kotlinx Serialization.',
+    description: 'Keep rules for FFmpegKit JNI, YoutubeDL-Android, Media3 ExoPlayer, ML Kit, and Kotlinx Serialization.',
     content: proguardRulesRaw,
   },
   {
@@ -85,7 +88,7 @@ const PROJECT_FILES: ProjectFile[] = [
     step: 1,
     path: '.github/workflows/build-apk.yml',
     language: 'yaml',
-    description: 'GitHub Actions workflow: triggers on any push, downloads verified FFmpegKit AAR, and builds ARM64 APK.',
+    description: 'GitHub Actions workflow: builds ARM64 APK, publishes direct APK to GitHub Releases + resilient Artifacts.',
     content: githubWorkflowRaw,
   },
   {
@@ -99,84 +102,105 @@ const PROJECT_FILES: ProjectFile[] = [
     step: 2,
     path: 'app/src/main/java/forge/media/pocket/service/PipelineForegroundService.kt',
     language: 'kotlin',
-    description: 'Android 14 Foreground LifecycleService running native yt-dlp/Aria2c and TelegramBotWorker.',
+    description: 'Android 14 Foreground LifecycleService running native yt-dlp/Aria2c and TelegramBotWorker (no unsolicited pool downloads).',
     content: pipelineServiceRaw,
   },
   {
     step: 3,
     path: 'app/src/main/java/forge/media/pocket/vision/FaceCenteringHelper.kt',
     language: 'kotlin',
-    description: '1 FPS FFmpeg thumbnail batch + Google ML Kit Face Detection with adaptive multi-speaker crop.',
+    description: 'ML Kit Face Detection + Auto 50/50 Split Seam Detector replacing foreign backgrounds automatically.',
     content: faceCenteringRaw,
   },
   {
     step: 3,
     path: 'app/src/main/java/forge/media/pocket/clutter/ClutterEntropyFilter.kt',
     language: 'kotlin',
-    description: 'Dual-sided entropy filter rejecting hard scene cuts (>0.40) and static freezes (>2.0s).',
+    description: 'On-demand single-URL downloader (YouTube, VK, Pikabu, Reddit, Rutube) + dual-sided entropy filter.',
     content: clutterFilterRaw,
+  },
+  {
+    step: 3,
+    path: 'app/src/main/java/forge/media/pocket/discovery/SearchBlacklistStore.kt',
+    language: 'kotlin',
+    description: 'Persistent Video & Channel Blacklist + custom Negative Tags store with reactive StateFlow.',
+    content: searchBlacklistRaw,
   },
   {
     step: 3,
     path: 'app/src/main/java/forge/media/pocket/discovery/TopicHunterEngine.kt',
     language: 'kotlin',
-    description: 'Autonomous Tag & Topic Hunter across YouTube, Reddit, and Pikabu with sorting and time filters.',
+    description: 'Link-Only Multi-Platform Crawler across YouTube (pagination), VK Clips, Pikabu, Reddit, and Rutube.',
     content: topicHunterRaw,
+  },
+  {
+    step: 3,
+    path: 'app/src/main/java/forge/media/pocket/discovery/BackgroundCrawlerManager.kt',
+    language: 'kotlin',
+    description: 'Background coroutine crawler for 10–30 Source Links and Infinite Background Link Harvesting until STOP.',
+    content: backgroundCrawlerRaw,
   },
   {
     step: 4,
     path: 'app/src/main/java/forge/media/pocket/subtitles/SubtitleAssTransformer.kt',
     language: 'kotlin',
-    description: 'VTT-to-ASS karaoke converter with movable vertical position and Gemini 2.5 Flash audio fallback.',
+    description: 'Groq Whisper Large-v3-Turbo word-level acoustic STT + Editable Phrase/Word Timing compiler to ASS karaoke.',
     content: subtitleTransformerRaw,
   },
   {
     step: 4,
     path: 'app/src/main/java/forge/media/pocket/compositor/FFmpegHardwareEngine.kt',
     language: 'kotlin',
-    description: 'Qualcomm h264_mediacodec hardware compositor supporting 4 assembly modes, ad layers, and anti-detect DSP.',
+    description: 'Snapdragon h264_mediacodec NLE clip baker (multi-cut, free crop, multi-delogo) and 9:16 master compositor.',
     content: ffmpegEngineRaw,
   },
   {
     step: 5,
     path: 'app/src/main/java/forge/media/pocket/telegram/GeminiMetadataClient.kt',
     language: 'kotlin',
-    description: 'Generates 3 viral titles, hashtags, and source/anime attribution comment via Gemini 2.5 Flash.',
+    description: 'Generates 3 viral titles, hashtags, and source attribution comment via Gemini Flash.',
     content: geminiClientRaw,
   },
   {
     step: 5,
     path: 'app/src/main/java/forge/media/pocket/telegram/TelegramBotWorker.kt',
     language: 'kotlin',
-    description: 'Full Telegram Bot controller with interactive layer matrix, tag hunter UI, and raw asset pack export.',
+    description: 'Telegram Bot controller synchronized with all 6 platforms, blacklists, and manual Studio inbox.',
     content: telegramWorkerRaw,
   },
   {
     step: 6,
     path: 'app/src/main/java/forge/media/pocket/config/NodeConfigStore.kt',
     language: 'kotlin',
-    description: 'Hybrid 6C storage reading BuildConfig defaults from GitHub Secrets with live on-device override.',
+    description: 'On-device credential store for Telegram Token, Groq Whisper API Key (gsk_...), Gemini Key, and Cookies.',
     content: nodeConfigStoreRaw,
   },
   {
     step: 6,
     path: 'app/src/main/java/forge/media/pocket/config/GeminiModelResolver.kt',
     language: 'kotlin',
-    description: 'Auto-discovers available v1beta Gemini Flash & TTS models on the user API key with 30-min cache.',
+    description: 'Resilient Gemini Flash & TTS model resolver with instant HTTP 404 retired-model circuit breaker.',
     content: geminiModelResolverRaw,
   },
   {
     step: 6,
-    path: 'app/src/main/java/forge/media/pocket/ui/StudioCanvasOverlayView.kt',
+    path: 'app/src/main/java/forge/media/pocket/ui/PreEditorWorkbenchScreen.kt',
     language: 'kotlin',
-    description: 'Interactive touch overlay for freeform H/V crop, split seam ratio drag, and multi-box watermark erasing.',
-    content: studioCanvasOverlayRaw,
+    description: 'Stage 1 Pre-Editor (Media3 ExoPlayer 60fps): multi-cut timeline, chunk deletion, touch crop, multi-delogo.',
+    content: preEditorWorkbenchRaw,
+  },
+  {
+    step: 6,
+    path: 'app/src/main/java/forge/media/pocket/ui/ForgeAssemblerScreen.kt',
+    language: 'kotlin',
+    description: 'Stage 2 Assembler: Dual 9:16 ExoPlayer, Groq Whisper word/phrase editor, 4-ch audio mixer, TTS, FullHD export.',
+    content: forgeAssemblerRaw,
   },
   {
     step: 6,
     path: 'app/src/main/java/forge/media/pocket/ui/MainActivity.kt',
     language: 'kotlin',
-    description: 'Dual-layer live TextureView Studio (CapCut/YouCut core), visual timeline scrubber, 3-stem mixer, and Scout UI.',
+    description: 'Jetpack Compose root uniting Link-Only Search, 4-Step Studio Workflow, Pre-Editor, Assembler, and Blacklist.',
     content: mainActivityRaw,
   },
 ];
@@ -184,7 +208,7 @@ const PROJECT_FILES: ProjectFile[] = [
 export default function App() {
   const [selectedStepFilter, setSelectedStepFilter] = useState<'all' | 1 | 2 | 3 | 4 | 5 | 6>('all');
   const [selectedFilePath, setSelectedFilePath] = useState<string>(
-    '.github/workflows/build-apk.yml'
+    'app/src/main/java/forge/media/pocket/ui/ForgeAssemblerScreen.kt'
   );
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
 
@@ -215,7 +239,7 @@ export default function App() {
     const lines: string[] = [
       '#!/usr/bin/env bash',
       'set -e',
-      'echo "Generating Complete Pocket Media Forge Android 14 Project (20 files)..."',
+      `echo "Generating Complete Pocket Media Forge v3.0 Project (${PROJECT_FILES.length} files)..."`,
     ];
     for (const file of PROJECT_FILES) {
       const dir = file.path.includes('/')
@@ -228,7 +252,7 @@ export default function App() {
       lines.push(file.content);
       lines.push('EOF_FORGE_FILE');
     }
-    lines.push('echo "All 20 files created! Push to GitHub to build your APK via GitHub Actions."');
+    lines.push(`echo "All ${PROJECT_FILES.length} files created! Push to GitHub to build your APK via GitHub Actions."`);
 
     const blob = new Blob([lines.join('\n')], { type: 'text/x-shellscript;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -250,14 +274,14 @@ export default function App() {
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-lg font-bold tracking-tight text-white">
-                  POCKET MEDIA FORGE
+                  POCKET MEDIA FORGE v3.0
                 </h1>
                 <span className="text-xs font-mono uppercase px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                  20 Real Kotlin & Gradle Files on Disk
+                  {PROJECT_FILES.length} Real Kotlin & Gradle Files on Disk
                 </span>
               </div>
               <p className="text-xs text-zinc-400">
-                Dual-Layer CapCut/YouCut Studio • Direct Innertube + Multi-Platform Scout • Snapdragon ARM64
+                2-Stage Compose + Media3 Studio • Groq Whisper Word Subtitles • Link-Only Multi-Platform Crawler
               </p>
             </div>
           </div>
@@ -280,7 +304,7 @@ export default function App() {
             <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
               <div className="flex items-center justify-between mb-3">
                 <span className="text-xs font-mono uppercase tracking-wider text-zinc-400">
-                  Реальные файлы в корне репо (20)
+                  Реальные файлы в корне репо ({PROJECT_FILES.length})
                 </span>
                 <div className="flex flex-wrap gap-1">
                   {(['all', 1, 2, 3, 4, 5, 6] as const).map((stepFilter) => (

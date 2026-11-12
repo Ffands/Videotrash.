@@ -17,13 +17,17 @@ import forge.media.pocket.config.NodeConfigStore
 import forge.media.pocket.vision.UpperBoxFramingPlan
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.request.forms.MultiPartFormDataContent
+import io.ktor.client.request.forms.formData
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.Headers
 import io.ktor.http.HttpHeaders
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
@@ -103,6 +107,52 @@ data class TimedWord(
     val endMs: Long
 )
 
+@Serializable
+data class EditableTimedWord(
+    val id: String = UUID.randomUUID().toString().take(8),
+    val text: String,
+    val startSec: Double,
+    val endSec: Double
+)
+
+@Serializable
+data class EditableSubtitlePhrase(
+    val id: String = UUID.randomUUID().toString().take(8),
+    val words: List<EditableTimedWord>
+) {
+    val startSec: Double
+        get() = words.minOfOrNull { it.startSec } ?: 0.0
+
+    val endSec: Double
+        get() = words.maxOfOrNull { it.endSec } ?: (startSec + 0.8)
+
+    val joinedText: String
+        get() = words.joinToString(" ") { it.text }
+
+    fun withReplacedPhraseText(newPhraseText: String): EditableSubtitlePhrase {
+        val tokens = newPhraseText.trim().split(Regex("""\s+""")).filter { it.isNotBlank() }
+        if (tokens.isEmpty()) return copy(words = emptyList())
+        if (tokens.size == words.size) {
+            return copy(
+                words = words.mapIndexed { idx, old -> old.copy(text = tokens[idx]) }
+            )
+        }
+        val pStart = startSec
+        val pEnd = endSec.coerceAtLeast(pStart + tokens.size * 0.16)
+        val step = (pEnd - pStart) / tokens.size.toDouble()
+        val rebuilt = tokens.mapIndexed { idx, tok ->
+            val ws = ((pStart + idx * step) * 100.0).roundToInt() / 100.0
+            val we = if (idx == tokens.lastIndex) {
+                (pEnd * 100.0).roundToInt() / 100.0
+            } else {
+                ((ws + step) * 100.0).roundToInt() / 100.0
+            }
+            EditableTimedWord(text = tok, startSec = ws, endSec = we.coerceAtLeast(ws + 0.08))
+        }
+        return copy(words = rebuilt)
+    }
+}
+
 data class SubtitlePreparationResult(
     val assFile: File?,
     val plainTranscriptText: String
@@ -132,6 +182,11 @@ class SubtitleAssTransformer(
     }
 
     private val httpClient = HttpClient(OkHttp) {
+        install(HttpTimeout) {
+            requestTimeoutMillis = 90_000L
+            connectTimeoutMillis = 20_000L
+            socketTimeoutMillis = 90_000L
+        }
         install(ContentNegotiation) {
             json(jsonFormat)
         }
@@ -143,6 +198,268 @@ class SubtitleAssTransformer(
         val endSec: Double = 1.0,
         val text: String = ""
     )
+
+    /**
+     * Модуль 1А: Акустическое пословное распознавание речи УЖЕ ОТРЕДАКТИРОВАННОГО ролика
+     * через Groq Whisper Large-v3-Turbo (`timestamp_granularities[]="word"`) с точностью до сотых долей секунды!
+     * Возвращает редактируемые фразы + строку статуса источника.
+     */
+    suspend fun transcribePreparedClipToEditablePhrases(
+        preparedVideoFile: File,
+        wordsPerPhrase: Int = 4,
+        languageHint: String = ""
+    ): Pair<List<EditableSubtitlePhrase>, String> = withContext(Dispatchers.IO) {
+        if (!preparedVideoFile.exists() || preparedVideoFile.length() < 1000L) {
+            return@withContext emptyList<EditableSubtitlePhrase>() to "Видеофайл не найден"
+        }
+
+        val groqKey = configStore.getGroqApiKey().trim()
+        if (groqKey.isNotBlank()) {
+            val groqWords = transcribeViaGroqWhisperWordTimestamps(preparedVideoFile, groqKey, languageHint)
+            if (groqWords.isNotEmpty()) {
+                val grouped = groupTimedWordsIntoEditablePhrases(groqWords, wordsPerPhrase)
+                return@withContext grouped to "✅ Groq Whisper Large-v3-Turbo: ${groqWords.size} слов (${grouped.size} фраз)"
+            }
+        }
+
+        // Fallback if Groq API key is empty or network call failed: Gemini Audio STT on the prepared file
+        val geminiWords = transcribeViaGeminiAudioFallback(
+            videoFile = preparedVideoFile,
+            trimStartSec = 0.0,
+            durationSec = 120.0
+        )
+        if (geminiWords.isNotEmpty()) {
+            val editableWords = geminiWords.map { tw ->
+                EditableTimedWord(
+                    text = tw.text,
+                    startSec = ((tw.startMs / 10.0).roundToInt()) / 100.0,
+                    endSec = ((tw.endMs / 10.0).roundToInt()) / 100.0
+                )
+            }
+            val grouped = groupTimedWordsIntoEditablePhrases(editableWords, wordsPerPhrase)
+            val note = if (groqKey.isBlank()) {
+                "ℹ️ Gemini Audio STT: ${editableWords.size} слов (добавь ключ Groq gsk_... для 100% акустической точности Whisper)"
+            } else {
+                "ℹ️ Резерв Gemini Audio STT: ${editableWords.size} слов"
+            }
+            return@withContext grouped to note
+        }
+
+        emptyList<EditableSubtitlePhrase>() to "⚠️ Не удалось распознать речь: укажи бесплатный Groq API Key (gsk_...) во вкладке «⚙️ Ключи»"
+    }
+
+    private suspend fun transcribeViaGroqWhisperWordTimestamps(
+        videoFile: File,
+        groqApiKey: String,
+        languageHint: String
+    ): List<EditableTimedWord> = withContext(Dispatchers.IO) {
+        val tempAudio = File(stagingDir, "whisper_${System.currentTimeMillis()}.m4a")
+        try {
+            val ok = extractSliceM4aAudio(
+                inputVideo = videoFile,
+                startSec = 0.0,
+                durationSec = 180.0,
+                outputM4a = tempAudio
+            )
+            if (!ok || !tempAudio.exists() || tempAudio.length() < 500L) {
+                DiagnosticLogger.log("WHISPER", "Не удалось извлечь аудиодорожку .m4a из видео для Groq Whisper")
+                return@withContext emptyList()
+            }
+
+            val audioBytes = tempAudio.readBytes()
+            DiagnosticLogger.log(
+                "WHISPER",
+                "🎙 Отправка аудио (${audioBytes.size / 1024} KB) в Groq Whisper Large-v3-Turbo (word-level timestamps)..."
+            )
+
+            val response = httpClient.post("https://api.groq.com/openai/v1/audio/transcriptions") {
+                header(HttpHeaders.Authorization, "Bearer $groqApiKey")
+                setBody(
+                    MultiPartFormDataContent(
+                        formData {
+                            append(
+                                key = "file",
+                                value = audioBytes,
+                                headers = Headers.build {
+                                    append(HttpHeaders.ContentType, "audio/mp4")
+                                    append(HttpHeaders.ContentDisposition, "filename=\"speech.m4a\"")
+                                }
+                            )
+                            append("model", "whisper-large-v3-turbo")
+                            append("response_format", "verbose_json")
+                            append("timestamp_granularities[]", "word")
+                            append("timestamp_granularities[]", "segment")
+                            if (languageHint.isNotBlank()) {
+                                append("language", languageHint.trim().take(2).lowercase(Locale.ROOT))
+                            }
+                        }
+                    )
+                )
+            }
+
+            val rawBody = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                DiagnosticLogger.log(
+                    "WHISPER:ERR",
+                    "Groq HTTP ${response.status.value}: ${rawBody.take(180)}"
+                )
+                return@withContext emptyList()
+            }
+
+            val root = jsonFormat.parseToJsonElement(rawBody).jsonObject
+            val wordsJson = root["words"]?.jsonArray
+            val parsedWords = mutableListOf<EditableTimedWord>()
+
+            if (wordsJson != null && wordsJson.isNotEmpty()) {
+                for (item in wordsJson) {
+                    val obj = item.jsonObject
+                    val wText = obj["word"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+                    if (wText.isBlank()) continue
+                    val startS = obj["start"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: 0.0
+                    val rawEndS = obj["end"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: (startS + 0.22)
+                    val endS = rawEndS.coerceAtLeast(startS + 0.08)
+                    parsedWords.add(
+                        EditableTimedWord(
+                            text = wText,
+                            startSec = (startS * 100.0).roundToInt() / 100.0,
+                            endSec = (endS * 100.0).roundToInt() / 100.0
+                        )
+                    )
+                }
+            }
+
+            // Fallback to segments array if words array was omitted
+            if (parsedWords.isEmpty()) {
+                val segsJson = root["segments"]?.jsonArray
+                if (segsJson != null) {
+                    for (seg in segsJson) {
+                        val obj = seg.jsonObject
+                        val segText = obj["text"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+                        val tokens = segText.split(Regex("""\s+""")).filter { it.isNotBlank() }
+                        if (tokens.isEmpty()) continue
+                        val sStart = obj["start"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: 0.0
+                        val sEnd = (obj["end"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: (sStart + 1.0))
+                            .coerceAtLeast(sStart + 0.20)
+                        val step = (sEnd - sStart) / tokens.size
+                        tokens.forEachIndexed { idx, tok ->
+                            val ws = ((sStart + idx * step) * 100.0).roundToInt() / 100.0
+                            val we = ((if (idx == tokens.lastIndex) sEnd else ws + step) * 100.0).roundToInt() / 100.0
+                            parsedWords.add(EditableTimedWord(text = tok, startSec = ws, endSec = we.coerceAtLeast(ws + 0.08)))
+                        }
+                    }
+                }
+            }
+
+            DiagnosticLogger.log("WHISPER", "✅ Groq Whisper вернул ${parsedWords.size} точных пословных таймкодов!")
+            parsedWords
+        } catch (e: Exception) {
+            DiagnosticLogger.logError("WHISPER", "Сбой запроса к Groq Whisper API", e)
+            emptyList()
+        } finally {
+            tempAudio.delete()
+        }
+    }
+
+    fun groupTimedWordsIntoEditablePhrases(
+        words: List<EditableTimedWord>,
+        maxWordsPerPhrase: Int = 4
+    ): List<EditableSubtitlePhrase> {
+        if (words.isEmpty()) return emptyList()
+        val cap = maxWordsPerPhrase.coerceIn(2, 8)
+        val phrases = mutableListOf<EditableSubtitlePhrase>()
+        val bucket = mutableListOf<EditableTimedWord>()
+
+        for (w in words) {
+            val prev = bucket.lastOrNull()
+            val hasPauseBreak = prev != null && (w.startSec - prev.endSec) >= 0.42
+            val prevEndedSentence = prev != null && (
+                prev.text.endsWith(".") || prev.text.endsWith("!") || prev.text.endsWith("?")
+                )
+
+            if (bucket.isNotEmpty() && (bucket.size >= cap || hasPauseBreak || prevEndedSentence)) {
+                phrases.add(EditableSubtitlePhrase(words = bucket.toList()))
+                bucket.clear()
+            }
+            bucket.add(w)
+        }
+        if (bucket.isNotEmpty()) {
+            phrases.add(EditableSubtitlePhrase(words = bucket.toList()))
+        }
+        return phrases
+    }
+
+    /**
+     * Компилирует отредактированные пользователем фразы и пословные таймкоды 1-в-1 в караоке `.ass` файл!
+     */
+    fun compileEditablePhrasesToAssFile(
+        phrases: List<EditableSubtitlePhrase>,
+        config: SubtitleLayerConfig,
+        framingPlan: UpperBoxFramingPlan?,
+        canvasWidth: Int = 1080,
+        canvasHeight: Int = 1920
+    ): File? {
+        val nonEmpty = phrases.filter { it.words.isNotEmpty() }
+        if (!config.enabled || nonEmpty.isEmpty()) return null
+
+        val (posX, posY) = config.resolveCoordinates(framingPlan, canvasWidth, canvasHeight)
+        val scaledFont = ((config.fontSizePx / 1920.0) * canvasHeight).roundToInt().coerceIn(28, 120)
+        val offsetMs = config.syncOffsetMs
+
+        val header = """
+            [Script Info]
+            ScriptType: v4.00+
+            PlayResX: $canvasWidth
+            PlayResY: $canvasHeight
+            WrapStyle: 0
+            ScaledBorderAndShadow: yes
+
+            [V4+ Styles]
+            Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+            Style: KaraokeStyle,Sans-Serif,$scaledFont,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,1,0,1,5,2,5,40,40,40,1
+
+            [Events]
+            Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+        """.trimIndent()
+
+        val sb = StringBuilder(header).append("\n")
+
+        for (phrase in nonEmpty) {
+            val wordsMs = phrase.words.mapNotNull { w ->
+                val sMs = ((w.startSec * 1000.0).roundToLong() + offsetMs).coerceAtLeast(0L)
+                val eMs = ((w.endSec * 1000.0).roundToLong() + offsetMs).coerceAtLeast(sMs + 80L)
+                if (w.text.isBlank()) null else Triple(w.text.trim(), sMs, eMs)
+            }
+            if (wordsMs.isEmpty()) continue
+
+            val pStartMs = wordsMs.first().second
+            val pEndMs = wordsMs.last().third.coerceAtLeast(pStartMs + 180L)
+            val startAss = formatAssTime(pStartMs)
+            val endAss = formatAssTime(pEndMs)
+
+            val karaokeText = buildString {
+                append("{\\an5\\pos($posX,$posY)}")
+                var cursorMs = pStartMs
+                for ((txt, wStart, wEnd) in wordsMs) {
+                    val gapCs = ((wStart - cursorMs).coerceAtLeast(0L) / 10L)
+                    if (gapCs > 2L) {
+                        append("{\\k$gapCs}")
+                    }
+                    val effStart = maxOf(cursorMs, wStart)
+                    val durCs = ((wEnd - effStart) / 10L).coerceIn(5L, 400L)
+                    val cleanTxt = txt.replace("{", "").replace("}", "").replace("\\", "")
+                    append("{\\k$durCs}$cleanTxt ")
+                    cursorMs = effStart + durCs * 10L
+                }
+            }.trim()
+
+            sb.append("Dialogue: 0,$startAss,$endAss,KaraokeStyle,,0,0,0,,$karaokeText\n")
+        }
+
+        val outAss = File(stagingDir, "subs_edited_${System.currentTimeMillis()}.ass")
+        outAss.writeText(sb.toString(), Charsets.UTF_8)
+        DiagnosticLogger.log("SUBS", "✅ Скомпилирован ручной .ass файл караоке (${nonEmpty.size} фраз)")
+        return outAss
+    }
 
     /**
      * Генерирует синхронные караоке-субтитры `.ass` с ТОЧНОЙ привязкой к обрезанному куску `[trimStartSec .. trimEndSec]`,

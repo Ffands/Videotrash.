@@ -579,6 +579,15 @@ class ClutterEntropyFilter(private val context: Context) {
             }
         }
 
+        // Strategy 0.5: Direct Pikabu Story Video Resolver (extracts .mp4 / .webm directly from Pikabu story HTML!)
+        if (sourceUrl.contains("pikabu.ru/story/", ignoreCase = true)) {
+            val pikabuMp4 = tryResolvePikabuStoryMp4Url(sourceUrl)
+            if (!pikabuMp4.isNullOrBlank() && tryDirectHttpDownload(pikabuMp4, finalMp4)) {
+                DiagnosticLogger.log("DOWNLOAD", "✅ Скачано видео напрямую с Pikabu CDN (${finalMp4.length() / 1024} KB)")
+                return@withContext trimIfNeeded(finalMp4, rawBase.name, maxDurationSec)
+            }
+        }
+
         val errors = mutableListOf<String>()
 
         // CRITICAL FIX AGAINST 360p ("ШАКАЛЫ"):
@@ -696,6 +705,25 @@ class ClutterEntropyFilter(private val context: Context) {
                 targetFile.exists() && targetFile.length() > 20_000L
             } catch (_: Exception) {
                 false
+            }
+        }
+
+    private suspend fun tryResolvePikabuStoryMp4Url(storyUrl: String): String? =
+        withContext(Dispatchers.IO) {
+            try {
+                val resp = httpClient.get(storyUrl) {
+                    header(
+                        HttpHeaders.UserAgent,
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
+                    )
+                }
+                if (!resp.status.isSuccess()) return@withContext null
+                val html = resp.bodyAsText()
+                Regex("""https://[a-zA-Z0-9._/-]+\.(?:pikabu\.ru|yaplakal\.com)/[^"'\s>]+\.mp4""")
+                    .find(html)?.value
+                    ?: Regex("""data-source="([^"]+\.mp4)"""").find(html)?.groupValues?.get(1)
+            } catch (_: Exception) {
+                null
             }
         }
 
@@ -1046,8 +1074,7 @@ class ClutterEntropyFilter(private val context: Context) {
         }
 
         if (candidatePool.isEmpty()) {
-            DiagnosticLogger.log("CLUTTER", "Пул фонов пуст — создаю размытый motion-фон из основного видео...")
-            triggerBackgroundPoolWarmupIfNeeded()
+            DiagnosticLogger.log("CLUTTER", "Пул фонов пуст — создаю размытый motion-фон из основного видео (без самовольного скачивания мусора)...")
             val fallbackOut = File(stagingDir, "fallback_clutter_${System.currentTimeMillis()}.mp4")
             if (fallbackPrimaryVideo != null && fallbackPrimaryVideo.exists()) {
                 val created = createStylizedFallbackClutterFromPrimary(

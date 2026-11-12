@@ -1,6 +1,7 @@
 -keep class com.arthenica.ffmpegkit.** { *; }
 -keep class com.yausername.** { *; }
 -keep class com.google.mlkit.** { *; }
+-keep class androidx.media3.** { *; }
 -keepattributes *Annotation*, InnerClasses, Signature
 -dontwarn java.awt.**
 -dontwarn javax.naming.**
