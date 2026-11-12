@@ -949,7 +949,6 @@ fun ForgeAssemblerScreen(
 
     if (showBgPoolDialog) {
         val poolFiles = remember { clutterFilter.listVerifiedPoolClips() }
-        val poolMeta = remember { clutterFilter.listPoolClipsMetadata().associateBy { it.fileName } }
         AlertDialog(
             onDismissRequest = { showBgPoolDialog = false },
             title = { Text("🕹 Выбери фоновый наполнитель (${poolFiles.size})") },
@@ -984,8 +983,8 @@ fun ForgeAssemblerScreen(
                         Text("Пул фонов пока пуст. Скачай фон из вкладки «Поиск -> Фоны-наполнители» или выбери видео с телефона.")
                     } else {
                         poolFiles.forEach { f ->
-                            val meta = poolMeta[f.name]
-                            val label = meta?.title?.takeIf { it.isNotBlank() } ?: f.nameWithoutExtension
+                            val meta = remember(f.name) { clutterFilter.getPoolClipMetadata(f) }
+                            val label = meta.title.ifBlank { f.nameWithoutExtension }
                             Card(
                                 colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
                                 modifier = Modifier
