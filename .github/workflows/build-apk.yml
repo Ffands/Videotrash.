@@ -1,0 +1,121 @@
+name: Build Pocket Media Forge APK
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  assemble-arm64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Configure Android SDK 34 (Direct sdkmanager without legacy 'tools' package)
+        run: |
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | sort -V | tail -n 1)
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Download FFmpegKit Full-GPL 6.0-2.LTS AAR (Option 1B Verified Mirror)
+        run: |
+          mkdir -p app/libs
+          curl -L --fail --retry 3 --retry-delay 5 \
+            -o app/libs/ffmpeg-kit-full-gpl-6.0-2.LTS.aar \
+            "https://github.com/BLAM-PTY-LTD/ffmpeg-kit-binaries/releases/download/v6.0.2/ffmpeg-kit-full-gpl.aar"
+          ls -lh app/libs/ffmpeg-kit-full-gpl-6.0-2.LTS.aar
+
+      - name: Setup Gradle 8.7
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+          cache-read-only: false
+
+      - name: Build Release APK (ARM64-v8a Self-Contained)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
+        run: |
+          gradle assembleRelease --stacktrace --no-daemon
+          APK_SRC=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+          cp "$APK_SRC" PocketMediaForge-arm64-v8a-release.apk
+          ls -lh PocketMediaForge-arm64-v8a-release.apk
+
+      - name: Publish Direct APK to GitHub Releases (No ZIP Needed on Phone)
+        id: gh_release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_NAME="latest-build"
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" PocketMediaForge-arm64-v8a-release.apk --clobber
+          else
+            gh release create "$TAG_NAME" PocketMediaForge-arm64-v8a-release.apk \
+              --title "Pocket Media Forge — Свежая сборка APK (arm64-v8a)" \
+              --notes "Автоматическая сборка коммита ${{ github.sha }}. Скачивай прямой .apk без распаковки архива."
+          fi
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/PocketMediaForge-arm64-v8a-release.apk"
+          echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 📱 Прямая ссылка на скачивание APK (GitHub Releases — без ZIP)"
+            echo "- **[⬇️ Скачать PocketMediaForge-arm64-v8a-release.apk]($RELEASE_URL)**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Compiled APK Artifact (Attempt 1 — Fast No-Recompress)
+        id: upload_primary
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketMediaForge-arm64-v8a-release
+          path: PocketMediaForge-arm64-v8a-release.apk
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Pause Before Artifact Retry (If GitHub Artifact Service Returned 502 HTML)
+        if: steps.upload_primary.outcome == 'failure'
+        run: |
+          echo "GitHub Artifact service returned transient HTML error; waiting 20s before retry..."
+          sleep 20
+
+      - name: Upload Compiled APK Artifact (Attempt 2 — Backoff Retry)
+        id: upload_retry
+        if: steps.upload_primary.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketMediaForge-arm64-v8a-release-retry
+          path: PocketMediaForge-arm64-v8a-release.apk
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Emergency Direct APK Mirror (If GitHub Artifacts Outage Persists)
+        if: steps.upload_primary.outcome == 'failure' && steps.upload_retry.outcome == 'failure'
+        run: |
+          echo "Both GitHub Artifact attempts hit GitHub 502 HTML outage. Uploading APK to 72h direct mirror..."
+          MIRROR_URL=$(curl -sS --retry 3 --retry-delay 5 \
+            -F "reqtype=fileupload" \
+            -F "time=72h" \
+            -F "fileToUpload=@PocketMediaForge-arm64-v8a-release.apk" \
+            "https://litterbox.catbox.moe/resources/internals/api.php" || true)
+          echo "Emergency APK URL: $MIRROR_URL"
+          {
+            echo "### 🚨 Резервная прямая ссылка на APK (на время сбоя GitHub Artifacts)"
+            echo "- **Скачать APK напрямую (72ч):** $MIRROR_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
