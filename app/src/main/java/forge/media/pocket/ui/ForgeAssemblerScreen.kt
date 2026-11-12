@@ -293,21 +293,20 @@ fun ForgeAssemblerScreen(
                 } else if (editablePhrases.isNotEmpty()) {
                     subtitleTransformer.compileEditablePhrasesToAssFile(
                         phrases = editablePhrases,
-                        layerConfig = subLayerCfg,
+                        config = subLayerCfg,
                         framingPlan = framingPlan,
                         canvasWidth = 1080,
                         canvasHeight = 1920
                     )
                 } else {
                     subtitleTransformer.prepareAssSubtitles(
-                        primaryVideoFile = srcFile,
                         sourceUrl = primarySourceUrl,
+                        localVideoFile = srcFile,
+                        config = subLayerCfg,
                         framingPlan = framingPlan,
-                        layerConfig = subLayerCfg,
-                        customVoiceoverScript = null,
-                        startOffsetSec = 0.0,
-                        clipDurationSec = totalDurSec
-                    ).assFile
+                        trimStartSec = 0.0,
+                        trimEndSec = totalDurSec
+                    ).first.assFile
                 }
             }
 
@@ -728,9 +727,7 @@ fun ForgeAssemblerScreen(
                                     try {
                                         val (phrases, note) = subtitleTransformer.transcribePreparedClipToEditablePhrases(
                                             preparedVideoFile = src,
-                                            sourceUrl = primarySourceUrl,
-                                            wordsPerPhrase = wordsPerPhrase,
-                                            separatedVocalStem = preparedPayload?.separatedStems?.vocalsOverlayFile
+                                            wordsPerPhrase = wordsPerPhrase
                                         )
                                         editablePhrases = phrases
                                         selectedPhraseId = phrases.firstOrNull()?.id

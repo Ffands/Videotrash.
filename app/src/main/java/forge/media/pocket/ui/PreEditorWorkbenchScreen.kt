@@ -967,12 +967,9 @@ fun PreEditorWorkbenchScreen(
                                 scope.launch {
                                     isRunningShazam = true
                                     try {
-                                        val firstKept = segments.firstOrNull { it.kept } ?: segments.first()
                                         val res = subtitleTransformer.analyzeMusicStemAndFindSimilar(
-                                            primaryVideoFile = primaryFile,
-                                            separatedMusicStem = separatedStems?.musicHarmonicsFile,
-                                            startSec = firstKept.startSec,
-                                            durationSec = firstKept.durationSec
+                                            musicStemFile = separatedStems?.musicHarmonicsFile ?: primaryFile,
+                                            videoTitle = primaryTitle
                                         )
                                         shazamResult = res
                                         onShowMessage("🎵 Трек определён: ${res.detectedTrackAndGenre}")
@@ -1009,7 +1006,7 @@ fun PreEditorWorkbenchScreen(
                             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Text("🎵 Распознано: ${shazam.detectedTrackAndGenre}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                 Text("Настроение/Ритм: ${shazam.moodAndBpm}", color = Color(0xFF94A3B8), fontSize = 11.sp)
-                                shazam.candidateTracks.take(3).forEach { (title, url) ->
+                                shazam.candidateTracks.take(3).forEach { (url, title) ->
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
                                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -1020,12 +1017,19 @@ fun PreEditorWorkbenchScreen(
                                             onClick = {
                                                 scope.launch {
                                                     onShowMessage("📥 Скачиваю фоновый трек без АП...")
-                                                    val f = subtitleTransformer.downloadReplacementMusicCandidate(url)
-                                                    if (f != null && f.exists()) {
-                                                        replacementMusicFile = f
-                                                        onShowMessage("✅ Музыкальная подложка готова: ${f.name}")
-                                                    } else {
-                                                        onShowMessage("⚠️ Не удалось скачать трек")
+                                                    try {
+                                                        val f = subtitleTransformer.downloadReplacementMusicCandidate(
+                                                            sourceUrl = url,
+                                                            trackTitle = title
+                                                        )
+                                                        if (f.exists()) {
+                                                            replacementMusicFile = f
+                                                            onShowMessage("✅ Музыкальная подложка готова: ${f.name}")
+                                                        } else {
+                                                            onShowMessage("⚠️ Не удалось скачать трек")
+                                                        }
+                                                    } catch (e: Exception) {
+                                                        onShowMessage("⚠️ Не удалось скачать трек: ${e.message}")
                                                     }
                                                 }
                                             }
@@ -1084,12 +1088,13 @@ fun PreEditorWorkbenchScreen(
                                         try {
                                             val firstKept = segments.firstOrNull { it.kept } ?: segments.first()
                                             val script = subtitleTransformer.generateDubbingScriptFromVideo(
-                                                primaryVideoFile = primaryFile,
                                                 sourceUrl = primarySourceUrl,
+                                                localVideoFile = primaryFile,
                                                 startSec = firstKept.startSec,
-                                                durationSec = firstKept.durationSec
+                                                endSec = firstKept.endSec,
+                                                isolatedVocalStemFile = separatedStems?.vocalsOverlayFile
                                             )
-                                            if (!script.isNullOrBlank()) {
+                                            if (script.isNotBlank()) {
                                                 dubScriptText = script
                                                 onShowMessage("📝 Текст для озвучки готов!")
                                             }
@@ -1111,13 +1116,11 @@ fun PreEditorWorkbenchScreen(
                                     scope.launch {
                                         isGeneratingDub = true
                                         try {
-                                            val firstKept = segments.firstOrNull { it.kept } ?: segments.first()
                                             val f = subtitleTransformer.synthesizeVoiceoverToAudioFile(
                                                 scriptText = dubScriptText,
-                                                voiceProfile = selectedVoiceProfile,
-                                                targetDurationSec = firstKept.durationSec
+                                                voiceProfile = selectedVoiceProfile
                                             )
-                                            if (f != null && f.exists()) {
+                                            if (f.exists()) {
                                                 generatedVoiceoverFile = f
                                                 onShowMessage("🎙 Озвучка синтезирована!")
                                             } else {
