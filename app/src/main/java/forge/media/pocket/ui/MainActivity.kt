@@ -96,8 +96,9 @@ import java.io.File
 
 private enum class MainBottomTab(val icon: String, val label: String) {
     SEARCH("🔎", "Поиск"),
-    STUDIO("🎬", "Студия YouCut"),
-    SETTINGS("⚙️", "Настройки и Лог")
+    PRE_EDITOR("✂️", "Разделка"),
+    ASSEMBLER("🎛", "Редактор"),
+    SETTINGS("⚙️", "Ключи и Бан")
 }
 
 private enum class SearchHubSubTab(val label: String) {
@@ -111,7 +112,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         DiagnosticLogger.init(applicationContext)
         SearchBlacklistStore.ensureInit(applicationContext)
-        DiagnosticLogger.log("UI", "Открыт главный экран Pocket Media Forge v4.0 (YouCut Studio + Gemini Frame Curator)")
+        DiagnosticLogger.log("UI", "Открыт главный экран Pocket Media Forge (Поиск + Разделка + Редактор)")
 
         try {
             PipelineForegroundService.startService(applicationContext)
@@ -186,12 +187,13 @@ private fun PocketMediaForgeRootApp(
     var currentTab by remember { mutableStateOf(MainBottomTab.SEARCH) }
     var searchSubTab by remember { mutableStateOf(SearchHubSubTab.SOURCES_BATCH) }
 
-    // Unified YouCut Studio State
+    // Two-Stage Studio State (Цех 1: Разделка -> Цех 2: Редактор-Сборщик)
     var studioPrimaryFile by remember { mutableStateOf<File?>(null) }
     var studioPrimaryTitle by remember { mutableStateOf("") }
     var studioPrimaryUrl by remember { mutableStateOf("") }
     var studioRecStartSec by remember { mutableDoubleStateOf(0.0) }
     var studioRecEndSec by remember { mutableDoubleStateOf(0.0) }
+    var preparedPayload by remember { mutableStateOf<PreparedWorkbenchPayload?>(null) }
 
     var studioBgFile by remember { mutableStateOf<File?>(null) }
     var studioBgTitle by remember { mutableStateOf("") }
@@ -229,8 +231,9 @@ private fun PocketMediaForgeRootApp(
                         studioPrimaryUrl = item.sourceUrl
                         studioRecStartSec = 0.0
                         studioRecEndSec = 0.0
-                        currentTab = MainBottomTab.STUDIO
-                        showToastMsg("🎬 Видео открыто на 1-й дорожке YouCut!")
+                        preparedPayload = null
+                        currentTab = MainBottomTab.PRE_EDITOR
+                        showToastMsg("✂️ Видео открыто в Цехе Разделки!")
                     }
                 } catch (e: Exception) {
                     showToastMsg("❌ Ошибка импорта видео: ${e.message}")
@@ -249,8 +252,8 @@ private fun PocketMediaForgeRootApp(
                     if (saved.exists()) {
                         studioBgFile = saved
                         studioBgTitle = saved.nameWithoutExtension
-                        currentTab = MainBottomTab.STUDIO
-                        showToastMsg("🕹 Фон добавлен на 2-ю дорожку YouCut!")
+                        currentTab = MainBottomTab.ASSEMBLER
+                        showToastMsg("🕹 Фон добавлен в пул и подключён в 🎛 Редактор!")
                     }
                 } catch (e: Exception) {
                     showToastMsg("❌ Ошибка добавления фона: ${e.message}")
@@ -329,13 +332,14 @@ private fun PocketMediaForgeRootApp(
                             studioPrimaryUrl = url
                             studioRecStartSec = sSec
                             studioRecEndSec = eSec
-                            currentTab = MainBottomTab.STUDIO
-                            showToastMsg("🎬 Ролик загружен на 1-й дорожке Студии YouCut!")
+                            preparedPayload = null
+                            currentTab = MainBottomTab.PRE_EDITOR
+                            showToastMsg("✂️ Исходник загружен в Разделку!")
                         },
                         onLoadBackgroundIntoStudio = { file, title ->
                             studioBgFile = file
                             studioBgTitle = title
-                            showToastMsg("🕹 Чистый фон добавлен в пул и на 2-ю дорожку Студии!")
+                            showToastMsg("🕹 Чистый фон добавлен в пул Редактора!")
                         },
                         onPickLocalPrimary = { pickPrimaryVideoLauncher.launch("video/*") },
                         onPickLocalBackground = { pickBgVideoLauncher.launch("video/*") },
@@ -343,38 +347,66 @@ private fun PocketMediaForgeRootApp(
                     )
                 }
 
-                MainBottomTab.STUDIO -> {
-                    YouCutStudioScreen(
+                MainBottomTab.PRE_EDITOR -> {
+                    PreEditorWorkbenchScreen(
                         primaryFile = studioPrimaryFile,
                         primaryTitle = studioPrimaryTitle,
                         primarySourceUrl = studioPrimaryUrl,
                         initialStartSec = studioRecStartSec,
                         initialEndSec = studioRecEndSec,
-                        backgroundFile = studioBgFile,
-                        backgroundTitle = studioBgTitle,
                         clutterFilter = clutterFilter,
                         hardwareEngine = hardwareEngine,
                         faceHelper = faceHelper,
                         subtitleTransformer = subtitleTransformer,
+                        importedVoiceoverFile = importedVoiceoverFile,
                         onPickPrimaryVideoFromPhone = { pickPrimaryVideoLauncher.launch("video/*") },
-                        onSelectPrimaryFromInbox = { f, t, u ->
+                        onSelectPrimaryFromInbox = { f, t, u, sSec, eSec ->
                             studioPrimaryFile = f
                             studioPrimaryTitle = t
                             studioPrimaryUrl = u
-                            studioRecStartSec = 0.0
-                            studioRecEndSec = 0.0
+                            studioRecStartSec = sSec
+                            studioRecEndSec = eSec
+                            preparedPayload = null
                         },
+                        onImportVoiceoverAudio = { pickVoiceoverAudioLauncher.launch("audio/*") },
+                        onJumpToSearchTab = {
+                            searchSubTab = SearchHubSubTab.SOURCES_BATCH
+                            currentTab = MainBottomTab.SEARCH
+                        },
+                        onSendPreparedToAssembler = { payload ->
+                            preparedPayload = payload
+                            studioPrimaryFile = payload.bakedVideoFile
+                            studioPrimaryTitle = payload.title
+                            studioPrimaryUrl = payload.sourceUrl
+                            currentTab = MainBottomTab.ASSEMBLER
+                            showToastMsg("🎛 Подготовленный исходник передан в Редактор-Сборщик!")
+                        },
+                        onShowMessage = ::showToastMsg
+                    )
+                }
+
+                MainBottomTab.ASSEMBLER -> {
+                    ForgeAssemblerScreen(
+                        primaryFile = studioPrimaryFile,
+                        primaryTitle = studioPrimaryTitle,
+                        primarySourceUrl = studioPrimaryUrl,
+                        backgroundFile = studioBgFile,
+                        backgroundTitle = studioBgTitle,
+                        preparedPayload = preparedPayload,
+                        clutterFilter = clutterFilter,
+                        hardwareEngine = hardwareEngine,
+                        faceHelper = faceHelper,
+                        subtitleTransformer = subtitleTransformer,
                         onSelectBackgroundFile = { bf, bt ->
                             studioBgFile = bf
                             studioBgTitle = bt
                         },
                         onPickBackgroundFromPhone = { pickBgVideoLauncher.launch("video/*") },
-                        onJumpToSearchTab = { forBg ->
-                            searchSubTab = if (forBg) SearchHubSubTab.BG_UNTIL_STOP else SearchHubSubTab.SOURCES_BATCH
+                        onJumpToPreEditor = { currentTab = MainBottomTab.PRE_EDITOR },
+                        onJumpToBackgroundSearch = {
+                            searchSubTab = SearchHubSubTab.BG_UNTIL_STOP
                             currentTab = MainBottomTab.SEARCH
                         },
-                        onImportVoiceoverAudio = { pickVoiceoverAudioLauncher.launch("audio/*") },
-                        importedVoiceoverFile = importedVoiceoverFile,
                         onShowMessage = ::showToastMsg
                     )
                 }
@@ -417,11 +449,11 @@ private fun SearchAndLibraryHubScreen(
     val savedBgNeg by SearchBlacklistStore.bgNegativeTags.collectAsState()
     val seenHistoryCount by SearchBlacklistStore.seenCount.collectAsState()
 
-    var sourceQuery by remember { mutableStateOf("Стендап про отношения") }
+    var sourceQuery by remember { mutableStateOf("Стендап монолог") }
     var sourceNegInput by remember(savedSourceNeg) { mutableStateOf(savedSourceNeg) }
     var sourcePlatform by remember { mutableStateOf(HuntPlatform.ALL) }
     var sourcePeriod by remember { mutableStateOf(SearchTimePeriod.MONTH) }
-    var sourceDuration by remember { mutableStateOf(SearchDurationMode.SHORTS_ONLY) }
+    var sourceDuration by remember { mutableStateOf(SearchDurationMode.ANY_UP_TO_6M) }
     var sourceLanguage by remember { mutableStateOf(SearchLanguageMode.RUSSIAN_ONLY) }
     var sourceSort by remember { mutableStateOf(ContentSortOrder.POPULAR) }
     var sourceTargetCount by remember { mutableIntStateOf(10) }
@@ -665,10 +697,10 @@ private fun SearchAndLibraryHubScreen(
                 DiscoveredLinkCard(
                     candidate = cand,
                     isDownloading = downloadingCardId == cand.id,
-                    primaryActionLabel = "🎬 В Студию YouCut",
+                    primaryActionLabel = "✂️ В Разделку",
                     onPrimaryAction = {
                         downloadingCardId = cand.id
-                        onShowMessage("📥 Скачиваю ролик в Студию YouCut...")
+                        onShowMessage("📥 Скачиваю исходник в Разделку...")
                         scope.launch {
                             try {
                                 val saved = clutterFilter.downloadSourceToStudioInbox(

@@ -28,7 +28,7 @@ import kotlin.random.Random
 enum class VideoLayoutLayer(val label: String) {
     SPLIT_VSTACK("Сплит Верх + Залипалка (Настраиваемый шов)"),
     FULLSCREEN_EDIT("На весь экран 9:16 (Свободный кроп)"),
-    CLEAN_ORIGINAL_CROP("✂️ Чистый Оригинал / Свободный Кроп (Как YouCut)"),
+    CLEAN_ORIGINAL_CROP("✂️ Чистый Оригинал (Свободный кроп)"),
     BLURRED_BG_FRAME("Кино-рамка 9:16 (Размытый фон)"),
     BRAINROT_VOICEOVER("Залипалка 9:16 + Звук исходника"),
     DISTORTED_ORIGINAL("Оригинал 9:16 с полями + Анти-Детект")

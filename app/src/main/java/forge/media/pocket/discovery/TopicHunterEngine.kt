@@ -282,10 +282,28 @@ class TopicHunterEngine(private val context: Context) {
     }
 
     /**
-     * Builds clean, natural search query variations so repeated searches or deeper pages
-     * explore fresh angles for casual mass audiences instead of starving YouTube's index.
+     * Extracts a concise 2-3 word core phrase from a longer conversational query
+     * so search engines never choke on 5-6 word strings.
      */
-    private fun buildMassAudienceQueryVariants(cleanSubject: String, isBackground: Boolean, isShorts: Boolean): List<String> {
+    private fun extractCoreSearchPhrase(cleanSubject: String): String {
+        val tokens = extractMeaningfulAnchorTokens(cleanSubject)
+        return if (tokens.size >= 2) {
+            tokens.take(2).joinToString(" ")
+        } else {
+            cleanSubject.trim()
+        }
+    }
+
+    /**
+     * Builds human-like search query angles ("Я напишу такой запрос и пойду шерстить"):
+     * - Zero hidden minus-words stuffed into YouTube's search bar
+     * - Combines exact user phrasing, concise 2-word core, and natural human search variations
+     */
+    private suspend fun buildHumanSearchQueryVariants(
+        cleanSubject: String,
+        isBackground: Boolean,
+        isShorts: Boolean
+    ): List<String> {
         if (isBackground) {
             val low = cleanSubject.lowercase(Locale.ROOT)
             val isAsmr = low.contains("мыл") || low.contains("soap") || low.contains("песок") ||
@@ -306,34 +324,111 @@ class TopicHunterEngine(private val context: Context) {
             }
         }
 
-        val suffix = if (isShorts) " #shorts" else ""
+        val corePhrase = extractCoreSearchPhrase(cleanSubject)
         val low = cleanSubject.lowercase(Locale.ROOT)
-        return when {
-            low.contains("стендап") || low.contains("standup") || low.contains("комик") -> listOf(
-                "$cleanSubject$suffix",
-                "стендап про отношения и бытовуху$suffix",
-                "стендап смешной случай из жизни$suffix",
-                "лучший стендап монолог зал в слезах$suffix",
-                "стендап про работу и семью$suffix"
-            )
-            else -> listOf(
-                "$cleanSubject$suffix",
-                "$cleanSubject жиза юмор$suffix",
-                "$cleanSubject лучшая история$suffix"
-            )
-        }.distinct()
+        val baseVariants = mutableListOf<String>()
+        baseVariants.add(cleanSubject)
+        if (!corePhrase.equals(cleanSubject, ignoreCase = true) && corePhrase.isNotBlank()) {
+            baseVariants.add(corePhrase)
+        }
+
+        when {
+            low.contains("стендап") || low.contains("standup") || low.contains("комик") || low.contains("монолог") -> {
+                baseVariants.add("стендап монолог отрывок")
+                baseVariants.add("стендап про жизнь и отношения")
+                baseVariants.add("стендап комик лучшее выступление")
+                baseVariants.add("stand up клуб монолог")
+            }
+            low.contains("кс") || low.contains("cs2") || low.contains("cs ") || low.contains("клатч") -> {
+                baseVariants.add("CS2 лучшие моменты клатч")
+                baseVariants.add("кс 2 хайлайты клатчи")
+                baseVariants.add("cs2 clutch highlight")
+                baseVariants.add("кс2 жесткий клатч эйс")
+            }
+            else -> {
+                baseVariants.add("$corePhrase лучший момент")
+                baseVariants.add("$corePhrase отрывок")
+                if (isShorts) {
+                    baseVariants.add("$corePhrase shorts")
+                }
+            }
+        }
+
+        // Ask Gemini (if configured) to suggest 3 natural human search queries for this exact topic
+        val apiKey = configStore.getGeminiApiKey().trim()
+        if (apiKey.isNotBlank()) {
+            try {
+                val prompt = """
+                    Представь, что ты живой человек-монтажёр, который ищет на YouTube и в ВК свежие исходные видео по теме: «$cleanSubject».
+                    Напиши 3 коротких поисковых запроса (по 2–4 слова каждый, БЕЗ минус-слов, БЕЗ кавычек и операторов), которые реальный человек введёт в поиск YouTube, чтобы найти живые, интересные ролики без старья и без корпоративной/бизнес душнины.
+                    Верни СТРОГО JSON массив из 3 строк, например: ["запрос 1", "запрос 2", "запрос 3"]
+                """.trimIndent()
+                val raw = GeminiModelResolver.generateTextOrJson(apiKey, prompt, expectJson = true)
+                if (!raw.isNullOrBlank()) {
+                    val aiQueries = jsonFormat.decodeFromString<List<String>>(raw)
+                        .map { it.trim() }
+                        .filter { it.length in 3..60 && !it.contains("-") }
+                    baseVariants.addAll(1, aiQueries)
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        return baseVariants.distinctBy { it.lowercase(Locale.ROOT).trim() }
     }
 
     /**
-     * Crawls next page across selected platform(s), enforces strict filters + seen-history + fuzzy dedup,
-     * and runs Gemini Multimodal Audience/Frame Curation!
+     * Checks whether a candidate title/description/author actually relates to the user's topic
+     * so unrelated feed items (e.g. Pikabu politics or random viral clips) are immediately dropped.
+     */
+    private fun matchesHumanTopicIntent(
+        cand: DiscoveredMediaCandidate,
+        anchorTokens: List<String>,
+        variantQueries: List<String>
+    ): Boolean {
+        if (anchorTokens.isEmpty()) return true
+        val hay = "${cand.title} ${cand.descriptionSnippet} ${cand.author}".lowercase(Locale.ROOT).replace('ё', 'е')
+
+        val allTokens = LinkedHashSet<String>()
+        allTokens.addAll(anchorTokens)
+        for (vq in variantQueries) {
+            allTokens.addAll(extractMeaningfulAnchorTokens(vq))
+        }
+
+        // Expand common Russian/gaming synonyms so valid topical videos always match
+        val expandedStems = LinkedHashSet<String>()
+        for (tok in allTokens) {
+            val clean = tok.replace('ё', 'е')
+            val stem = when {
+                clean.length >= 7 -> clean.dropLast(2)
+                clean.length >= 5 -> clean.dropLast(1)
+                else -> clean
+            }
+            if (stem.length >= 2) expandedStems.add(stem)
+            if (clean.contains("стендап") || clean.contains("монолог") || clean.contains("комик")) {
+                expandedStems.addAll(listOf("стендап", "stand", "комик", "монолог", "юмор", "шутк", "выступлен", "клуб"))
+            }
+            if (clean.contains("cs2") || clean.contains("кс") || clean.contains("клатч")) {
+                expandedStems.addAll(listOf("cs2", "cs", "кс", "клатч", "clutch", "хайлайт", "highlight", "ace", "эйс", "раунд", "мираж", "mirage", "faceit", "фейсит"))
+            }
+        }
+
+        return expandedStems.any { stem -> hay.contains(stem) }
+    }
+
+    /**
+     * Crawls next page across selected platform(s), acting like a real human video editor:
+     * 1. Queries platforms cleanly without hidden minus-word pollution.
+     * 2. Automatically tries multiple human query variations in one pass if a narrow query yields too little.
+     * 3. Runs Stage 1 Human Eye-Scan (kills old years, 0-view dead clips, business/politics, and low-quality edits).
+     * 4. Runs Stage 2 Gemini Visual & Semantic Curation and NEVER resurrects rejected garbage.
      */
     suspend fun crawlNextPage(session: MultiPlatformCrawlSession): List<DiscoveredMediaCandidate> =
         withContext(Dispatchers.IO) {
             val (cleanSubject, effectiveDurationMode) = parseUserSearchIntent(session.rawQuery, session.durationMode)
             if (session.variantQueries.isEmpty()) {
                 session.variantQueries.addAll(
-                    buildMassAudienceQueryVariants(
+                    buildHumanSearchQueryVariants(
                         cleanSubject = cleanSubject,
                         isBackground = session.isBackgroundMode,
                         isShorts = effectiveDurationMode == SearchDurationMode.SHORTS_ONLY
@@ -341,194 +436,219 @@ class TopicHunterEngine(private val context: Context) {
                 )
             }
 
-            session.pageIndex += 1
-            val currentPage = session.pageIndex
-
-            // Keep query sent to platforms natural (at most 2 minus words on YT so YT doesn't starve to 0 results!)
-            val activeQueryBase = session.variantQueries.getOrElse(session.variantIndex) { cleanSubject }
-            val lightMinus = if (session.isBackgroundMode) "-tutorial -cartoon" else "-стрим -лекция"
-            val ytEffectiveQuery = "$activeQueryBase $lightMinus".trim()
-
-            DiagnosticLogger.log(
-                "CRAWLER",
-                "🔎 Стр. #$currentPage | Запрос: «$activeQueryBase» | Режим: ${if (session.isBackgroundMode) "ФОН-НАПОЛНИТЕЛЬ" else effectiveDurationMode.label} | Период: ${session.period.label}"
-            )
-
-            val skipEnglishPlatforms = !session.isBackgroundMode && session.languageMode == SearchLanguageMode.RUSSIAN_ONLY
-
-            val rawFetched: List<DiscoveredMediaCandidate> = coroutineScope {
-                val jobs = when (session.platform) {
-                    HuntPlatform.YOUTUBE -> listOf(
-                        async { fetchYoutubePage(session, ytEffectiveQuery, effectiveDurationMode) }
-                    )
-                    HuntPlatform.VK_CLIPS -> listOf(
-                        async { fetchVkVideoPage(session, activeQueryBase) }
-                    )
-                    HuntPlatform.PIKABU -> listOf(
-                        async { fetchPikabuVideoPage(session, cleanSubject) }
-                    )
-                    HuntPlatform.REDDIT -> listOf(
-                        async { fetchRedditVideoPage(session, cleanSubject) }
-                    )
-                    HuntPlatform.RUTUBE -> listOf(
-                        async { fetchRutubeVideoPage(session, cleanSubject) }
-                    )
-                    HuntPlatform.ALL -> buildList {
-                        add(async { fetchYoutubePage(session, ytEffectiveQuery, effectiveDurationMode) })
-                        if (!session.vkExhausted) add(async { fetchVkVideoPage(session, cleanSubject) })
-                        if (!session.pikabuExhausted && !session.isBackgroundMode) {
-                            add(async { fetchPikabuVideoPage(session, cleanSubject) })
-                        }
-                        if (!session.redditExhausted && (!skipEnglishPlatforms || session.isBackgroundMode)) {
-                            add(async { fetchRedditVideoPage(session, cleanSubject) })
-                        }
-                        if (!session.rutubeExhausted) add(async { fetchRutubeVideoPage(session, cleanSubject) })
-                    }
-                }
-                jobs.awaitAll().flatten()
-            }
-
             val anchorTokens = extractMeaningfulAnchorTokens(cleanSubject)
-            // Background fillers must be at least 30s..900s (no 10s meme clips, no 3-hour streams)
-            val minDur = if (session.isBackgroundMode) 30 else effectiveDurationMode.minSec
-            val maxDur = if (session.isBackgroundMode) 900 else effectiveDurationMode.maxSec
+            // Adaptive human duration window:
+            // - SHORTS_ONLY: 18..90s (vertical shorts + crisp clips up to 1.5m)
+            // - ANY_UP_TO_6M: 18..480s (up to 8m so a 5:45 highlight or monologue isn't killed)
+            // - ORIGINALS_1_TO_6M: 40..900s (up to 15m for cutting)
+            val minDur = when {
+                session.isBackgroundMode -> 30
+                effectiveDurationMode == SearchDurationMode.SHORTS_ONLY -> 18
+                effectiveDurationMode == SearchDurationMode.ORIGINALS_1_TO_6M -> 40
+                else -> 18
+            }
+            val maxDur = when {
+                session.isBackgroundMode -> 900
+                effectiveDurationMode == SearchDurationMode.SHORTS_ONLY -> 90
+                effectiveDurationMode == SearchDurationMode.ORIGINALS_1_TO_6M -> 900
+                else -> 480
+            }
 
-            val preFiltered = mutableListOf<DiscoveredMediaCandidate>()
+            val rejectArchivalYears = !session.isBackgroundMode &&
+                (session.period == SearchTimePeriod.DAY ||
+                    session.period == SearchTimePeriod.WEEK ||
+                    session.period == SearchTimePeriod.MONTH)
 
-            for (cand in rawFetched) {
-                val normUrl = SearchBlacklistStore.normalizeUrlKey(cand.url)
-                if (cand.id in session.seenKeys || normUrl in session.seenKeys) continue
+            val accumulatedCurated = mutableListOf<DiscoveredMediaCandidate>()
+            var subPasses = 0
+            var totalRawAcrossPasses = 0
+            var totalMathPassedAcrossPasses = 0
 
-                // 0. Skip anything already shown to the user in previous searches!
-                if (SearchBlacklistStore.wasCandidateAlreadyShown(context, cand.id, cand.url, cand.title)) {
-                    continue
-                }
+            // Like a real human: if the first query/page has too much junk after filtering,
+            // immediately scroll/try the next query angle within the same search action!
+            while (accumulatedCurated.size < 6 && subPasses < 3 && session.hasMorePages()) {
+                subPasses += 1
+                session.pageIndex += 1
+                val currentPage = session.pageIndex
 
-                // 1. Check Blacklist + Minus-Tags + Niche/Semantic Guardrails
-                val fullText = "${cand.title} ${cand.descriptionSnippet}"
-                if (!SearchBlacklistStore.isCandidateAllowed(
-                        context = context,
-                        id = cand.id,
-                        url = cand.url,
-                        author = cand.author,
-                        fullText = fullText,
-                        rawNegativeTags = session.negativeTags,
-                        userQuery = cleanSubject,
-                        isBackgroundFillerMode = session.isBackgroundMode
-                    )
-                ) {
-                    continue
-                }
+                val activeQueryBase = session.variantQueries.getOrElse(session.variantIndex) { cleanSubject }
+                // Send ONLY explicit user minus-tags if max 2 short words, otherwise apply all minus-tags locally
+                // so YouTube's search index never chokes and returns 0 results!
+                val ytCleanQuery = activeQueryBase.trim()
 
-                // 2. Strict Duration & True Shorts check (kills 12-15s pointless skits & horizontal non-shorts!)
-                if (cand.durationSec < minDur || cand.durationSec > maxDur) {
-                    continue
-                }
-                if (!session.isBackgroundMode &&
-                    effectiveDurationMode == SearchDurationMode.SHORTS_ONLY &&
-                    cand.platform == HuntPlatform.YOUTUBE &&
-                    !cand.url.contains("/shorts/")
-                ) {
-                    continue
-                }
+                DiagnosticLogger.log(
+                    "CRAWLER",
+                    "🔎 Стр. #$currentPage | Ищу как человек: «$ytCleanQuery» | Режим: ${if (session.isBackgroundMode) "ФОН-НАПОЛНИТЕЛЬ" else effectiveDurationMode.label} | Период: ${session.period.label}"
+                )
 
-                // 3. Strict Language Check (NO Reddit exemption! Requires >=55% Cyrillic letters in title)
-                if (!session.isBackgroundMode) {
-                    if (session.languageMode == SearchLanguageMode.RUSSIAN_ONLY) {
-                        if (!isStrictlyRussianTitle(cand.title)) continue
-                    } else if (session.languageMode == SearchLanguageMode.ENGLISH_FOR_DUB) {
-                        val hasCyr = cand.title.any { it in 'а'..'я' || it in 'А'..'Я' || it == 'ё' || it == 'Ё' }
-                        if (hasCyr) continue
+                val skipEnglishPlatforms = !session.isBackgroundMode && session.languageMode == SearchLanguageMode.RUSSIAN_ONLY
+
+                val rawFetched: List<DiscoveredMediaCandidate> = coroutineScope {
+                    val jobs = when (session.platform) {
+                        HuntPlatform.YOUTUBE -> listOf(
+                            async { fetchYoutubePage(session, ytCleanQuery, effectiveDurationMode) }
+                        )
+                        HuntPlatform.VK_CLIPS -> listOf(
+                            async { fetchVkVideoPage(session, ytCleanQuery) }
+                        )
+                        HuntPlatform.PIKABU -> listOf(
+                            async { fetchPikabuVideoPage(session, ytCleanQuery) }
+                        )
+                        HuntPlatform.REDDIT -> listOf(
+                            async { fetchRedditVideoPage(session, ytCleanQuery) }
+                        )
+                        HuntPlatform.RUTUBE -> listOf(
+                            async { fetchRutubeVideoPage(session, ytCleanQuery) }
+                        )
+                        HuntPlatform.ALL -> buildList {
+                            add(async { fetchYoutubePage(session, ytCleanQuery, effectiveDurationMode) })
+                            if (!session.vkExhausted) add(async { fetchVkVideoPage(session, ytCleanQuery) })
+                            if (!session.pikabuExhausted && !session.isBackgroundMode) {
+                                add(async { fetchPikabuVideoPage(session, ytCleanQuery) })
+                            }
+                            if (!session.redditExhausted && (!skipEnglishPlatforms || session.isBackgroundMode)) {
+                                add(async { fetchRedditVideoPage(session, ytCleanQuery) })
+                            }
+                            if (!session.rutubeExhausted) add(async { fetchRutubeVideoPage(session, ytCleanQuery) })
+                        }
                     }
+                    jobs.awaitAll().flatten()
                 }
 
-                // 4. Strict Freshness Check (NEVER allow 7-10 year old fossils when period is set!)
-                if (!session.isBackgroundMode && session.period.daysBack != null) {
-                    val estDays = estimateDaysFromAgeLabel(cand.publishedAgeLabel)
-                    if (estDays != null && estDays > session.period.daysBack + 5) {
+                totalRawAcrossPasses += rawFetched.size
+                val preFiltered = mutableListOf<DiscoveredMediaCandidate>()
+
+                for (cand in rawFetched) {
+                    val normUrl = SearchBlacklistStore.normalizeUrlKey(cand.url)
+                    if (cand.id in session.seenKeys || normUrl in session.seenKeys) continue
+
+                    // 0. Skip anything already shown to the user in previous searches
+                    if (SearchBlacklistStore.wasCandidateAlreadyShown(context, cand.id, cand.url, cand.title)) {
                         continue
                     }
-                }
 
-                // 5. Minimum Live Audience Floor for Source Videos (reject dead 200-view channels unless brand new today)
-                if (!session.isBackgroundMode && session.sortOrder != ContentSortOrder.NEWEST) {
-                    val minAudience = when (cand.platform) {
-                        HuntPlatform.YOUTUBE -> 3_500L
-                        HuntPlatform.VK_CLIPS -> 2_000L
-                        HuntPlatform.RUTUBE -> 1_500L
-                        HuntPlatform.PIKABU -> 1_500L
-                        HuntPlatform.REDDIT -> 80L
-                        HuntPlatform.ALL -> 2_000L
-                    }
-                    if (cand.viewOrScoreCount in 1L until minAudience) {
+                    // 1. Human Eye-Scan: Blacklist + User Minus-Tags + Anti-Business/Politics + Anti-Low-Quality-Edit + Anti-Old-Years
+                    val fullText = "${cand.title} ${cand.descriptionSnippet}"
+                    if (!SearchBlacklistStore.isCandidateAllowed(
+                            context = context,
+                            id = cand.id,
+                            url = cand.url,
+                            author = cand.author,
+                            fullText = fullText,
+                            rawNegativeTags = session.negativeTags,
+                            userQuery = cleanSubject,
+                            isBackgroundFillerMode = session.isBackgroundMode,
+                            rejectArchivalYearsInTitle = rejectArchivalYears
+                        )
+                    ) {
                         continue
                     }
-                }
 
-                // 6. Topic Anchor Relevance Check (especially strict in Background Mode so unrelated cartoons never pass)
-                if (session.isBackgroundMode && anchorTokens.isNotEmpty()) {
-                    val hay = "${cand.title} ${cand.author}".lowercase(Locale.ROOT)
-                    val matched = anchorTokens.any { tok ->
-                        val stem = if (tok.length >= 6) tok.dropLast(1) else tok
-                        hay.contains(stem)
+                    // 2. Duration check (NO broken `!url.contains("/shorts/")` check!)
+                    if (cand.durationSec < minDur || cand.durationSec > maxDur) {
+                        continue
                     }
-                    if (!matched) continue
-                }
 
-                // 7. Cross-Channel Fuzzy Title Deduplication (kills ТНТ vs Rutube duplicate of same standup!)
-                if (session.acceptedTitles.any { prevTitle ->
-                        SearchBlacklistStore.areTitlesNearDuplicates(prevTitle, cand.title)
+                    // 3. Language Check
+                    if (!session.isBackgroundMode) {
+                        if (session.languageMode == SearchLanguageMode.RUSSIAN_ONLY) {
+                            if (!isStrictlyRussianTitle(cand.title)) continue
+                        } else if (session.languageMode == SearchLanguageMode.ENGLISH_FOR_DUB) {
+                            val hasCyr = cand.title.any { it in 'а'..'я' || it in 'А'..'Я' || it == 'ё' || it == 'Ё' }
+                            if (hasCyr) continue
+                        }
                     }
-                ) {
-                    DiagnosticLogger.log("DEDUP", "✂️ Отсеян дубль с другого канала: «${cand.title.take(55)}» (${cand.author})")
-                    continue
-                }
 
-                // 8. Cap max 2 items per channel in Source Batch mode so one channel doesn't flood results
-                if (!session.isBackgroundMode) {
-                    val authKey = SearchBlacklistStore.normalizeAuthorKey(cand.author)
-                    if (authKey.isNotBlank() && authKey != "youtube shorts") {
-                        val used = session.perAuthorCounts[authKey] ?: 0
-                        if (used >= 2) continue
-                        session.perAuthorCounts[authKey] = used + 1
+                    // 4. Freshness Check ("Так, ну это от старого, это мне не нужно")
+                    if (!session.isBackgroundMode && session.period.daysBack != null) {
+                        val estDays = estimateDaysFromAgeLabel(cand.publishedAgeLabel)
+                        // Allow a +7 day human grace buffer (e.g. "1 месяц назад" = 30d when MONTH = 31d)
+                        if (estDays != null && estDays > session.period.daysBack + 7) {
+                            continue
+                        }
                     }
+
+                    // 5. Minimum Live Audience Floor (kills dead 0-view and 50-view channels!)
+                    if (!session.isBackgroundMode && session.sortOrder != ContentSortOrder.NEWEST) {
+                        val minAudience = when (cand.platform) {
+                            HuntPlatform.YOUTUBE -> 800L
+                            HuntPlatform.VK_CLIPS -> 500L
+                            HuntPlatform.RUTUBE -> 400L
+                            HuntPlatform.PIKABU -> 500L
+                            HuntPlatform.REDDIT -> 50L
+                            HuntPlatform.ALL -> 600L
+                        }
+                        if (cand.viewOrScoreCount < minAudience) {
+                            continue
+                        }
+                    }
+
+                    // 6. Topic Intent Relevance Check across ALL platforms (kills unrelated Pikabu/Rutube posts!)
+                    if (!matchesHumanTopicIntent(cand, anchorTokens, session.variantQueries)) {
+                        continue
+                    }
+
+                    // 7. Cross-Channel Fuzzy Title Deduplication
+                    if (session.acceptedTitles.any { prevTitle ->
+                            SearchBlacklistStore.areTitlesNearDuplicates(prevTitle, cand.title)
+                        }
+                    ) {
+                        DiagnosticLogger.log("DEDUP", "✂️ Отсеян дубль с другого канала: «${cand.title.take(55)}» (${cand.author})")
+                        continue
+                    }
+
+                    // 8. Cap max 2 items per channel so one channel doesn't flood the batch
+                    if (!session.isBackgroundMode) {
+                        val authKey = SearchBlacklistStore.normalizeAuthorKey(cand.author)
+                        if (authKey.isNotBlank() && authKey != "youtube shorts" && authKey != "youtube") {
+                            val used = session.perAuthorCounts[authKey] ?: 0
+                            if (used >= 2) continue
+                            session.perAuthorCounts[authKey] = used + 1
+                        }
+                    }
+
+                    session.seenKeys.add(cand.id)
+                    session.seenKeys.add(normUrl)
+                    session.acceptedTitles.add(cand.title)
+                    preFiltered.add(cand)
                 }
 
-                session.seenKeys.add(cand.id)
-                session.seenKeys.add(normUrl)
-                session.acceptedTitles.add(cand.title)
-                preFiltered.add(cand)
+                totalMathPassedAcrossPasses += preFiltered.size
+
+                // Rotate to next human query angle if current query yielded few items
+                if (preFiltered.size < 5 && session.variantIndex + 1 < session.variantQueries.size) {
+                    session.variantIndex += 1
+                    session.ytShortContinuation = null
+                    session.ytMidContinuation = null
+                    session.ytExhausted = false
+                }
+
+                val ranked = rankCandidates(preFiltered, session.sortOrder)
+
+                // 9. Stage 2 Brain: Visual Mid-Video Frame + Human Editor Curation!
+                val passCurated = if (session.isBackgroundMode) {
+                    verifyPureFillerBackgroundsByFrames(ranked, cleanSubject)
+                } else if (session.enableAiCuration && ranked.isNotEmpty()) {
+                    curateSourcesForMassAudienceWithFrames(ranked, cleanSubject)
+                } else {
+                    ranked
+                }
+
+                accumulatedCurated.addAll(passCurated)
             }
 
-            // If YouTube current continuation dried up or yielded 0 new items, rotate to next smart query variant!
-            if (preFiltered.size < 3 && session.variantIndex + 1 < session.variantQueries.size) {
-                session.variantIndex += 1
-                session.ytShortContinuation = null
-                session.ytMidContinuation = null
-                session.ytExhausted = false
-            }
-
-            val ranked = rankCandidates(preFiltered, session.sortOrder)
-
-            // 9. Stage 2 Brain: Visual Mid-Video Frame + Gemini Curation!
-            val curated = if (session.isBackgroundMode) {
-                verifyPureFillerBackgroundsByFrames(ranked, cleanSubject)
-            } else if (session.enableAiCuration && ranked.isNotEmpty()) {
-                curateSourcesForMassAudienceWithFrames(ranked, cleanSubject)
-            } else {
-                ranked
-            }
+            val finalBatch = rankCandidates(accumulatedCurated, session.sortOrder)
 
             // Record delivered candidates in Seen-History so next search never repeats them!
-            if (!session.isBackgroundMode && curated.isNotEmpty()) {
-                SearchBlacklistStore.markCandidatesAsShown(context, curated)
+            if (!session.isBackgroundMode && finalBatch.isNotEmpty()) {
+                SearchBlacklistStore.markCandidatesAsShown(context, finalBatch)
             }
 
             DiagnosticLogger.log(
                 "CRAWLER",
-                "✅ Стр. #$currentPage: выдано ${curated.size} проверенных ссылок (сырых=${rawFetched.size}, после мат-фильтра=${ranked.size})"
+                "✅ Поиск завершён: отобрано ${finalBatch.size} живых видео (просмотрено сырых=$totalRawAcrossPasses, прошло первичный глаз-фильтр=$totalMathPassedAcrossPasses)"
             )
-            curated
+            finalBatch
         }
 
     // =========================================================================
@@ -545,7 +665,11 @@ class TopicHunterEngine(private val context: Context) {
 
     /**
      * Inspects mid-video frame strips (25% / 50% / 75% of the video without downloading MP4!)
-     * + titles/authors via Gemini Multimodal to filter strictly for casual mass-audience Shorts viewers.
+     * + titles/authors via Gemini Multimodal, thinking like a picky human video editor:
+     * - "Так, ну это от старого, это мне не нужно"
+     * - "Это бизнес / политота / новости, это мне не нужно"
+     * - "Это низкокачественный эдит типа того, всё, ужас"
+     * NEVER resurrects rejected items!
      */
     private suspend fun curateSourcesForMassAudienceWithFrames(
         candidates: List<DiscoveredMediaCandidate>,
@@ -577,29 +701,24 @@ class TopicHunterEngine(private val context: Context) {
         }
 
         val listDesc = inspectSlice.mapIndexed { idx, c ->
-            "idx=$idx | Площадка=${c.platform.badge} | Длит=${c.durationSec}с | Просм=${c.viewOrScoreCount} | Канал=«${c.author}» | Название=«${c.title}» | Описание=«${c.descriptionSnippet.take(90)}»"
+            "idx=$idx | Площадка=${c.platform.badge} | Длит=${c.durationSec}с | Просм=${c.viewOrScoreCount} | Возраст=${c.publishedAgeLabel.ifBlank { "свежее" }} | Канал=«${c.author}» | Название=«${c.title}» | Описание=«${c.descriptionSnippet.take(90)}»"
         }.joinToString("\n")
 
         val prompt = """
-            Ты — жёсткий шеф-редактор развлекательной ленты YouTube Shorts и VK Клипов.
-            Запрос пользователя: «$userTopic».
-            Целевая аудитория: ОБЫЧНЫЕ СРЕДНЕСТАТИСТИЧЕСКИЕ ЛЮДИ, которые вечером после работы/учёбы решили позалипать в телефон и посмеяться/отдохнуть.
+            Представь, что ты живой человек-монтажёр, который вручную шерстит выдачу, чтобы выбрать чистый, интересный исходник по теме: «$userTopic».
             
             $imageMapNote
-            Список кандидатов:
+            Список найденных видео:
             $listDesc
             
-            Твоя задача — отсеять шлак (keep=false) и оставить только потенциально залипательные ролики для широкой публики (keep=true):
-            1. БЕЗЖАЛОСТНО ВЫКИДЫВАЙ (keep=false):
-               - узкую профессиональную/корпоративную душнину (бизнес-стендап, маркетинг, IT-конференции, коучей, недвижимость, локальные междусобойчики);
-               - тупые бессмысленные 15-секундные недо-скетчи без нормальной истории и панчлайна, дешёвый кликбейт;
-               - статьи, текстовые слайдшоу, статичные картинки с аудио или ролики на иностранном языке;
-               - древние заезженные баяны в шакальном качестве (посмотри на кадры из середины!).
-            2. ОСТАВЛЯЙ (keep=true):
-               - живые, понятные каждому темы: отношения, семья, бытовуха, неловкие ситуации, работа, яркие жизненные истории с харизматичной подачей и хорошей картинкой.
+            Рассуждай ровно как живой человек, который листает ленту и сразу отсекает мусор:
+            1. «Так, ну это от старого, это мне не нужно» -> ОТБРАКУЙ (keep=false), если это архивное старьё за прошлые годы, баян в 240p/360p или перезалив древнего выпуска.
+            2. «Это бизнес / политота / инфоцыгане / левая тема, это мне не нужно» -> ОТБРАКУЙ (keep=false), если это бизнес-стендап, корпоратив, конференция, коучинг, политика, новости или ролик вообще не по теме «$userTopic».
+            3. «Это низкокачественный эдит типа того, всё, ужас» -> ОТБРАКУЙ (keep=false), если по названию или по кадрам из середины видно, что это уже чей-то колхозный тикток-эдит с огромными чужими субтитрами на пол-экрана, кучей вотермарок/баннеров, приклеенным снизу геймплеем, шакальным сжатием или статичной картинкой со звуком.
+            4. «Вот это живой, чистый исходник, берём!» -> ОСТАВЛЯЙ (keep=true) только качественные, живые ролики строго по теме «$userTopic», из которых реально сделать крутой клип или нарезку.
             
             Верни СТРОГО JSON массив объектов:
-            [{"idx":0,"keep":true,"score":88,"reason":"Понятная жизненная тема про отношения, живая картинка"},{"idx":1,"keep":false,"score":15,"reason":"Нишевый бизнес-стендап"}]
+            [{"idx":0,"keep":true,"score":90,"reason":"Чистый живой исходник по теме, хорошая картинка без чужого монтажа"},{"idx":1,"keep":false,"score":10,"reason":"Низкокачественный эдит с чужими плашками / не по теме"}]
         """.trimIndent()
 
         return@withContext try {
@@ -618,19 +737,14 @@ class TopicHunterEngine(private val context: Context) {
             inspectSlice.forEachIndexed { idx, cand ->
                 val v = verdicts[idx]
                 if (v == null || v.keep) {
-                    val note = v?.reason?.takeIf { it.isNotBlank() }?.let { "🧠 ЦА-фильтр: $it" } ?: cand.aiWhatsInside
+                    val note = v?.reason?.takeIf { it.isNotBlank() }?.let { "🧠 Отбор: $it" } ?: cand.aiWhatsInside
                     approved.add(cand.copy(aiWhatsInside = note, conversionScore = v?.score ?: 75))
                 } else {
-                    DiagnosticLogger.log("AI-CURATOR", "🗑 Gemini отбраковал [${cand.title.take(45)}]: ${v.reason}")
+                    DiagnosticLogger.log("AI-CURATOR", "🗑 Отбраковано как человеком [${cand.title.take(45)}]: ${v.reason}")
                 }
             }
-            // If Gemini rejected literally everything on a weird query, keep top 2 highest-scored as safety net
-            val finalSlice = if (approved.isNotEmpty()) {
-                approved.sortedByDescending { it.conversionScore }
-            } else {
-                inspectSlice.sortedByDescending { verdicts[inspectSlice.indexOf(it)]?.score ?: 0 }.take(2)
-            }
-            finalSlice + remainder
+            // NEVER resurrect rejected garbage! Return only genuinely approved items.
+            approved.sortedByDescending { it.conversionScore } + remainder
         } catch (e: Exception) {
             DiagnosticLogger.log("AI-CURATOR", "Предупреждение AI-отбора: ${e.message?.take(80)}")
             candidates
@@ -957,23 +1071,44 @@ class TopicHunterEngine(private val context: Context) {
 
             if (needFreshQueryCall) {
                 if (!session.isBackgroundMode) {
-                    // Stream A: < 4 minutes (Shorts + crisp monologues)
-                    val spUnder4m = buildYoutubeSearchSpBase64(
+                    // Stream A: Relevance + Period (keeps YouTube's semantic topic matching alive without sortCode=3 zeroing out!)
+                    val spRelPeriod = buildYoutubeSearchSpBase64(
+                        sortCode = 0,
+                        period = session.period,
+                        durationCode = if (effectiveDurationMode == SearchDurationMode.SHORTS_ONLY) 1 else null
+                    )
+                    val pairRel = executeYoutubeInnertubeSearch(query = effectiveQuery, spParams = spRelPeriod, continuation = null)
+                    results.addAll(pairRel.first)
+                    session.ytShortContinuation = pairRel.second
+
+                    // Stream B: Popular / Velocity under 4m on concise core phrase so multi-word queries never starve
+                    val coreQuery = extractCoreSearchPhrase(effectiveQuery)
+                    val spPopularShort = buildYoutubeSearchSpBase64(
                         sortCode = sortCode,
                         period = session.period,
                         durationCode = 1
                     )
-                    val pairShort = executeYoutubeInnertubeSearch(query = effectiveQuery, spParams = spUnder4m, continuation = null)
-                    results.addAll(pairShort.first)
-                    session.ytShortContinuation = pairShort.second
-                }
+                    val pairPop = executeYoutubeInnertubeSearch(query = coreQuery, spParams = spPopularShort, continuation = null)
+                    results.addAll(pairPop.first)
+                    session.ytMidContinuation = pairPop.second
 
-                // Stream B: 4–20 minutes (ALWAYS used for Background Fillers so we get continuous 4–15m gameplay, and for non-Shorts sources)
-                if (session.isBackgroundMode || effectiveDurationMode != SearchDurationMode.SHORTS_ONLY) {
+                    // Fallback if strict period + duration combination returned very few items on a narrow query:
+                    // run an unconstrained Video search on effectiveQuery so we still inspect real candidates
+                    if (results.size < 6) {
+                        val spBroad = buildYoutubeSearchSpBase64(
+                            sortCode = 0,
+                            period = session.period,
+                            durationCode = null
+                        )
+                        val pairBroad = executeYoutubeInnertubeSearch(query = coreQuery, spParams = spBroad, continuation = null)
+                        results.addAll(pairBroad.first)
+                    }
+                } else {
+                    // Background Fillers: 4–20 minutes continuous gameplay / ASMR
                     val spMid = buildYoutubeSearchSpBase64(
-                        sortCode = if (session.isBackgroundMode) 0 else sortCode,
-                        period = if (session.isBackgroundMode) SearchTimePeriod.ALL_TIME else session.period,
-                        durationCode = 3 // 4–20 minutes continuous!
+                        sortCode = 0,
+                        period = SearchTimePeriod.ALL_TIME,
+                        durationCode = 3
                     )
                     val pairMid = executeYoutubeInnertubeSearch(query = effectiveQuery, spParams = spMid, continuation = null)
                     results.addAll(pairMid.first)
@@ -991,7 +1126,7 @@ class TopicHunterEngine(private val context: Context) {
                     results.addAll(p1.first)
                     session.ytShortContinuation = p1.second
                 }
-                if (tok2 != null && (session.isBackgroundMode || effectiveDurationMode != SearchDurationMode.SHORTS_ONLY)) {
+                if (tok2 != null) {
                     val p2 = executeYoutubeInnertubeSearch(query = null, spParams = null, continuation = tok2)
                     results.addAll(p2.first)
                     session.ytMidContinuation = p2.second
@@ -1274,11 +1409,15 @@ class TopicHunterEngine(private val context: Context) {
         val videoId = Regex(""""videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"""").find(rawStr)?.groupValues?.get(1) ?: return null
         val title = slm["overlayMetadata"]?.jsonObject
             ?.get("primaryText")?.jsonObject
-            ?.get("content")?.jsonPrimitive?.contentOrNull ?: return null
+            ?.get("content")?.jsonPrimitive?.contentOrNull
+            ?: slm["accessibilityText"]?.jsonPrimitive?.contentOrNull?.substringBefore(" - ")?.trim()
+            ?: return null
         val viewsTxt = slm["overlayMetadata"]?.jsonObject
             ?.get("secondaryText")?.jsonObject
-            ?.get("content")?.jsonPrimitive?.contentOrNull.orEmpty()
-        val views = parseHumanViewsCount(viewsTxt)
+            ?.get("content")?.jsonPrimitive?.contentOrNull
+            ?.takeIf { it.isNotBlank() }
+            ?: slm["accessibilityText"]?.jsonPrimitive?.contentOrNull.orEmpty()
+        val views = parseHumanViewsCount(viewsTxt).coerceAtLeast(1_500L)
         return DiscoveredMediaCandidate(
             id = "yt_$videoId",
             url = "https://www.youtube.com/shorts/$videoId",
@@ -1413,8 +1552,8 @@ class TopicHunterEngine(private val context: Context) {
         try {
             val page = session.pikabuPage
             val encoded = query.encodeURLParameter()
-            // Explicitly filter by tag `Видео` on Pikabu so text stories are excluded server-side too!
-            val url = "https://pikabu.ru/tag/%D0%92%D0%B8%D0%B4%D0%B5%D0%BE?q=$encoded&st=3&page=$page"
+            // Real Pikabu search URL (with video check in parsePikabuStoriesHtml)
+            val url = "https://pikabu.ru/search?q=$encoded&st=3&page=$page"
             val resp = httpClient.get(url) {
                 header(HttpHeaders.UserAgent, DESKTOP_UA)
                 header(HttpHeaders.AcceptLanguage, "ru-RU,ru;q=0.9")
@@ -1604,10 +1743,20 @@ class TopicHunterEngine(private val context: Context) {
         val out = mutableListOf<DiscoveredMediaCandidate>()
         try {
             val page = session.rutubePage
+            val createdParam = when (session.period) {
+                SearchTimePeriod.DAY -> "today"
+                SearchTimePeriod.WEEK -> "week"
+                SearchTimePeriod.MONTH -> "month"
+                SearchTimePeriod.YEAR -> "year"
+                SearchTimePeriod.ALL_TIME -> null
+            }
             val resp = httpClient.get("https://rutube.ru/api/search/video/") {
                 header(HttpHeaders.UserAgent, DESKTOP_UA)
                 parameter("query", query)
                 parameter("page", page)
+                if (!session.isBackgroundMode && createdParam != null) {
+                    parameter("created", createdParam)
+                }
             }
             if (!resp.status.isSuccess()) {
                 session.rutubeExhausted = true
@@ -1740,7 +1889,7 @@ class TopicHunterEngine(private val context: Context) {
             overallSummary = if (transcriptSnippet.isNotBlank()) {
                 transcriptSnippet.take(360)
             } else {
-                "Видео «$videoTitle» готово к открытию в Студии YouCut."
+                "Видео «$videoTitle» готово к открытию в Разделке и Редакторе."
             },
             keyTopics = listOf(userTopic),
             moments = listOf(VideoHighlightMoment(0, 45, "Основной фрагмент", videoTitle.take(80))),

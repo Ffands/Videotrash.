@@ -74,9 +74,9 @@ class PipelineForegroundService : LifecycleService() {
         private val updaterHttpClient by lazy {
             HttpClient(OkHttp) {
                 install(HttpTimeout) {
-                    requestTimeoutMillis = 90_000L
-                    connectTimeoutMillis = 20_000L
-                    socketTimeoutMillis = 90_000L
+                    requestTimeoutMillis = 15_000L
+                    connectTimeoutMillis = 6_000L
+                    socketTimeoutMillis = 15_000L
                 }
             }
         }
@@ -122,8 +122,8 @@ class PipelineForegroundService : LifecycleService() {
                 val currentVer = queryRealYtDlpVersion()
                 DiagnosticLogger.log("YTDLP-VER", "Проверка реальной версии бинарника yt-dlp: $currentVer")
 
-                if (!forceDownload && (currentVer.startsWith("2026.") || currentVer.startsWith("2025.12"))) {
-                    DiagnosticLogger.log("YTDLP-UPDATE", "Бинарник yt-dlp уже свежий ($currentVer), замена не требуется.")
+                if (!forceDownload && (currentVer.startsWith("2026.") || currentVer.startsWith("2025."))) {
+                    DiagnosticLogger.log("YTDLP-INIT", "✅ Встроенное ядро yt-dlp ($currentVer) готово к работе без ожидания GitHub.")
                     return@withContext currentVer
                 }
 

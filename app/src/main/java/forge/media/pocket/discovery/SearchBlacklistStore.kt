@@ -37,14 +37,27 @@ object SearchBlacklistStore {
         "-гайд -туториал -обзор -прохождение -сюжет -мультик -анимация -стрим -реакция -guide -tutorial -cartoon -story -highlights"
 
     /**
-     * Niche / corporate / professional boredom terms that alienate ordinary casual Shorts viewers.
-     * Filtered out automatically unless the user explicitly typed that term in their query.
+     * Niche / corporate / professional / politics / news boredom terms that a human editor immediately skips
+     * ("Это бизнес / инфоцыгане / политота / новости, это мне не нужно").
      */
     private val NICHE_BORING_SOURCE_TERMS = listOf(
         "бизнес-стендап", "бизнес стендап", "корпоратив", "конференц", "форум",
         "маркетинг", "таргетолог", "недвижимост", "риэлтор", "тренинг", "коуч",
         "инфобиз", "ит-стендап", "it-стендап", "айти стендап", "вебинар", "лекция",
-        "семинар", "пленарн", "круглый стол", "b2b", "стартап", "отдел продаж"
+        "семинар", "пленарн", "круглый стол", "b2b", "стартап", "отдел продаж",
+        "русофоби", "политик", "известия недели", "новости дня", "депутат", "госдум",
+        "минфин", "центробанк", "ключевая ставка", "налоговая", "бухгалтер"
+    )
+
+    /**
+     * Low-quality re-edit / template / watermark / garbage montage terms that a human editor skips
+     * ("Это низкокачественный эдит типа того, всё, ужас").
+     */
+    private val LOW_QUALITY_EDIT_TERMS = listOf(
+        "эдит", "edit", "phonk", "фонк", "capcut", "капкат", "шаблон", "template",
+        "футаж", "хромакей", "статус для", "сигма эдит", "sigma edit", "перезалив",
+        "reupload", "144p", "240p", "360p", "реакция на", "смотрит и реагирует",
+        "полный выпуск", "полная запись стрима", "запись эфира"
     )
 
     /**
@@ -61,6 +74,8 @@ object SearchBlacklistStore {
         "highlights", "хайлайт", "тир лист", "tier list", "топ 10", "top 10", "топ 5", "top 5",
         "спидран", "speedrun", "баги", "читы", "моды", "mods", "trailer", "трейлер", "тизер", "cutscene", "катсцен"
     )
+
+    private val ARCHIVAL_OLD_YEAR_REGEX = Regex("""\b(200\d|201\d|202[0-4])\b""")
 
     private val TITLE_STOP_WORDS = setOf(
         "и", "в", "во", "на", "с", "со", "о", "об", "про", "по", "за", "из", "от", "до", "для",
@@ -311,7 +326,8 @@ object SearchBlacklistStore {
         fullText: String,
         rawNegativeTags: String,
         userQuery: String = "",
-        isBackgroundFillerMode: Boolean = false
+        isBackgroundFillerMode: Boolean = false,
+        rejectArchivalYearsInTitle: Boolean = true
     ): Boolean {
         ensureInit(context)
         val vids = _bannedVideoKeys.value
@@ -339,11 +355,24 @@ object SearchBlacklistStore {
             }
             if (hitSemanticGarbage) return false
         } else {
-            // Reject corporate/business/coaching niche boredom unless user explicitly asked for it
+            // 1. "Это бизнес / политота / новости, это мне не нужно"
             val hitNicheBoredom = NICHE_BORING_SOURCE_TERMS.any { niche ->
                 !queryLow.contains(niche) && haystack.contains(niche)
             }
             if (hitNicheBoredom) return false
+
+            // 2. "Это низкокачественный эдит типа того, всё, ужас"
+            val hitLowQualityEdit = LOW_QUALITY_EDIT_TERMS.any { editTerm ->
+                !queryLow.contains(editTerm) && haystack.contains(editTerm)
+            }
+            if (hitLowQualityEdit) return false
+
+            // 3. "Так, ну это от старого (2014–2024), это мне не нужно"
+            if (rejectArchivalYearsInTitle && !ARCHIVAL_OLD_YEAR_REGEX.containsMatchIn(queryLow)) {
+                if (ARCHIVAL_OLD_YEAR_REGEX.containsMatchIn(haystack)) {
+                    return false
+                }
+            }
         }
 
         return true

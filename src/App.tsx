@@ -29,7 +29,8 @@ import geminiClientRaw from '../app/src/main/java/forge/media/pocket/telegram/Ge
 import telegramWorkerRaw from '../app/src/main/java/forge/media/pocket/telegram/TelegramBotWorker.kt?raw';
 import nodeConfigStoreRaw from '../app/src/main/java/forge/media/pocket/config/NodeConfigStore.kt?raw';
 import geminiModelResolverRaw from '../app/src/main/java/forge/media/pocket/config/GeminiModelResolver.kt?raw';
-import youCutStudioRaw from '../app/src/main/java/forge/media/pocket/ui/YouCutStudioScreen.kt?raw';
+import preEditorWorkbenchRaw from '../app/src/main/java/forge/media/pocket/ui/PreEditorWorkbenchScreen.kt?raw';
+import forgeAssemblerRaw from '../app/src/main/java/forge/media/pocket/ui/ForgeAssemblerScreen.kt?raw';
 import mainActivityRaw from '../app/src/main/java/forge/media/pocket/ui/MainActivity.kt?raw';
 
 interface ProjectFile {
@@ -183,16 +184,23 @@ const PROJECT_FILES: ProjectFile[] = [
   },
   {
     step: 6,
-    path: 'app/src/main/java/forge/media/pocket/ui/YouCutStudioScreen.kt',
+    path: 'app/src/main/java/forge/media/pocket/ui/PreEditorWorkbenchScreen.kt',
     language: 'kotlin',
-    description: 'Unified Single-Screen YouCut Studio: scrollable Filmstrip timeline, trim handles, Pinch-to-Zoom/Pan, Undo/Redo, and FFmpeg+Gemini voice sync.',
-    content: youCutStudioRaw,
+    description: 'Цех 1 (Разделка): 4-handle visual crop, watermark delogo/blur masks, multi-segment cutter, stem splitter, AI Shazam, and dubbing.',
+    content: preEditorWorkbenchRaw,
+  },
+  {
+    step: 6,
+    path: 'app/src/main/java/forge/media/pocket/ui/ForgeAssemblerScreen.kt',
+    language: 'kotlin',
+    description: 'Цех 2 (Редактор-Сборщик): 9:16 dual-player split preview, Groq-free FFmpeg+Gemini speech-island subtitles, karaoke editor, and 1080p export.',
+    content: forgeAssemblerRaw,
   },
   {
     step: 6,
     path: 'app/src/main/java/forge/media/pocket/ui/MainActivity.kt',
     language: 'kotlin',
-    description: 'Compose v4.0 root uniting Gemini Frame-Curated Search, Single-Screen YouCut Studio, and 1500-line Copyable Log.',
+    description: 'Compose 4-tab root (Поиск, Разделка, Редактор, Ключи и Бан) with Human-Mind Adaptive Search and 1500-line Copyable Log.',
     content: mainActivityRaw,
   },
 ];
@@ -200,7 +208,7 @@ const PROJECT_FILES: ProjectFile[] = [
 export default function App() {
   const [selectedStepFilter, setSelectedStepFilter] = useState<'all' | 1 | 2 | 3 | 4 | 5 | 6>('all');
   const [selectedFilePath, setSelectedFilePath] = useState<string>(
-    'app/src/main/java/forge/media/pocket/ui/YouCutStudioScreen.kt'
+    'app/src/main/java/forge/media/pocket/discovery/TopicHunterEngine.kt'
   );
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
 
