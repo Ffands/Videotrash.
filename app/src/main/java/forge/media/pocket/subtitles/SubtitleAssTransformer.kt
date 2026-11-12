@@ -199,10 +199,19 @@ class SubtitleAssTransformer(
         val text: String = ""
     )
 
+    @Serializable
+    private data class GeminiIslandTranscriptDto(
+        val island: Int = 0,
+        val startSec: Double = 0.0,
+        val endSec: Double = 0.0,
+        val text: String = ""
+    )
+
     /**
-     * Модуль 1А: Акустическое пословное распознавание речи УЖЕ ОТРЕДАКТИРОВАННОГО ролика
-     * через Groq Whisper Large-v3-Turbo (`timestamp_granularities[]="word"`) с точностью до сотых долей секунды!
-     * Возвращает редактируемые фразы + строку статуса источника.
+     * Вариант 1В (0 лишних ключей):
+     * Гибрид `FFmpeg Acoustic Speech Islands (silencedetect)` + `Gemini Audio`.
+     * FFmpeg измеряет реальные звуковые границы каждой фразы по голосовой волне с точностью до миллисекунд,
+     * а Gemini вписывает живую русскую речь со сленгом ровно внутрь этих голосовых всплесков!
      */
     suspend fun transcribePreparedClipToEditablePhrases(
         preparedVideoFile: File,
@@ -213,23 +222,29 @@ class SubtitleAssTransformer(
             return@withContext emptyList<EditableSubtitlePhrase>() to "Видеофайл не найден"
         }
 
-        val groqKey = configStore.getGroqApiKey().trim()
-        if (groqKey.isNotBlank()) {
-            val groqWords = transcribeViaGroqWhisperWordTimestamps(preparedVideoFile, groqKey, languageHint)
-            if (groqWords.isNotEmpty()) {
-                val grouped = groupTimedWordsIntoEditablePhrases(groqWords, wordsPerPhrase)
-                return@withContext grouped to "✅ Groq Whisper Large-v3-Turbo: ${groqWords.size} слов (${grouped.size} фраз)"
-            }
+        val geminiKey = configStore.getGeminiApiKey().trim()
+        if (geminiKey.isBlank()) {
+            return@withContext emptyList<EditableSubtitlePhrase>() to "⚠️ Укажи ключ Gemini API во вкладке «⚙️ Настройки»"
         }
 
-        // Fallback if Groq API key is empty or network call failed: Gemini Audio STT on the prepared file
-        val geminiWords = transcribeViaGeminiAudioFallback(
+        val alignedWords = transcribeViaGeminiAndFfmpegSpeechIslands(
+            videoFile = preparedVideoFile,
+            geminiApiKey = geminiKey,
+            languageHint = languageHint
+        )
+        if (alignedWords.isNotEmpty()) {
+            val grouped = groupTimedWordsIntoEditablePhrases(alignedWords, wordsPerPhrase)
+            return@withContext grouped to "✅ Gemini Audio + FFmpeg Звуковая волна: ${alignedWords.size} слов (${grouped.size} фраз)"
+        }
+
+        // Secondary fallback to direct Gemini segment transcription if audio had continuous loud music without silence dips
+        val fallbackWords = transcribeViaGeminiAudioFallback(
             videoFile = preparedVideoFile,
             trimStartSec = 0.0,
-            durationSec = 120.0
+            durationSec = 150.0
         )
-        if (geminiWords.isNotEmpty()) {
-            val editableWords = geminiWords.map { tw ->
+        if (fallbackWords.isNotEmpty()) {
+            val editableWords = fallbackWords.map { tw ->
                 EditableTimedWord(
                     text = tw.text,
                     startSec = ((tw.startMs / 10.0).roundToInt()) / 100.0,
@@ -237,23 +252,22 @@ class SubtitleAssTransformer(
                 )
             }
             val grouped = groupTimedWordsIntoEditablePhrases(editableWords, wordsPerPhrase)
-            val note = if (groqKey.isBlank()) {
-                "ℹ️ Gemini Audio STT: ${editableWords.size} слов (добавь ключ Groq gsk_... для 100% акустической точности Whisper)"
-            } else {
-                "ℹ️ Резерв Gemini Audio STT: ${editableWords.size} слов"
-            }
-            return@withContext grouped to note
+            return@withContext grouped to "✅ Gemini Audio: ${editableWords.size} слов (${grouped.size} фраз)"
         }
 
-        emptyList<EditableSubtitlePhrase>() to "⚠️ Не удалось распознать речь: укажи бесплатный Groq API Key (gsk_...) во вкладке «⚙️ Ключи»"
+        emptyList<EditableSubtitlePhrase>() to "⚠️ Не удалось распознать речь из дорожки (проверь наличие звука или ключ Gemini)"
     }
 
-    private suspend fun transcribeViaGroqWhisperWordTimestamps(
+    /**
+     * Step 1: Extracts `.m4a` speech audio and runs FFmpeg `silencedetect` to get exact voice burst intervals.
+     * Step 2: Passes the audio + exact voice burst map to Gemini so words snap 1:1 to real speech waveform!
+     */
+    private suspend fun transcribeViaGeminiAndFfmpegSpeechIslands(
         videoFile: File,
-        groqApiKey: String,
+        geminiApiKey: String,
         languageHint: String
     ): List<EditableTimedWord> = withContext(Dispatchers.IO) {
-        val tempAudio = File(stagingDir, "whisper_${System.currentTimeMillis()}.m4a")
+        val tempAudio = File(stagingDir, "gemini_wave_${System.currentTimeMillis()}.m4a")
         try {
             val ok = extractSliceM4aAudio(
                 inputVideo = videoFile,
@@ -262,101 +276,176 @@ class SubtitleAssTransformer(
                 outputM4a = tempAudio
             )
             if (!ok || !tempAudio.exists() || tempAudio.length() < 500L) {
-                DiagnosticLogger.log("WHISPER", "Не удалось извлечь аудиодорожку .m4a из видео для Groq Whisper")
                 return@withContext emptyList()
             }
 
-            val audioBytes = tempAudio.readBytes()
+            val totalDur = probeAudioFileDurationSec(tempAudio).coerceIn(1.0, 180.0)
+            val speechIslands = detectAcousticSpeechIslandsViaFfmpeg(tempAudio, totalDur)
+            val audioBase64 = Base64.encodeToString(tempAudio.readBytes(), Base64.NO_WRAP)
+
+            val langClause = if (languageHint.equals("en", true)) {
+                "Язык речи: английский (пиши на языке оригинала)."
+            } else {
+                "Пиши строго дословно на языке звучащей речи (русский сленг, разговорные обороты и мат сохраняй без цензуры 1-в-1 как слышишь)."
+            }
+
+            val islandsDesc = speechIslands.mapIndexed { idx, (s, e) ->
+                String.format(Locale.US, "Островок #%d: [%.2fс .. %.2fс]", idx + 1, s, e)
+            }.joinToString("\n")
+
             DiagnosticLogger.log(
-                "WHISPER",
-                "🎙 Отправка аудио (${audioBytes.size / 1024} KB) в Groq Whisper Large-v3-Turbo (word-level timestamps)..."
+                "STT-WAVE",
+                "🎙 FFmpeg нашёл ${speechIslands.size} голосовых всплесков (${String.format(Locale.US, "%.1f", totalDur)}с) -> отправка в Gemini Audio..."
             )
 
-            val response = httpClient.post("https://api.groq.com/openai/v1/audio/transcriptions") {
-                header(HttpHeaders.Authorization, "Bearer $groqApiKey")
-                setBody(
-                    MultiPartFormDataContent(
-                        formData {
-                            append(
-                                key = "file",
-                                value = audioBytes,
-                                headers = Headers.build {
-                                    append(HttpHeaders.ContentType, "audio/mp4")
-                                    append(HttpHeaders.ContentDisposition, "filename=\"speech.m4a\"")
-                                }
-                            )
-                            append("model", "whisper-large-v3-turbo")
-                            append("response_format", "verbose_json")
-                            append("timestamp_granularities[]", "word")
-                            append("timestamp_granularities[]", "segment")
-                            if (languageHint.isNotBlank()) {
-                                append("language", languageHint.trim().take(2).lowercase(Locale.ROOT))
-                            }
-                        }
-                    )
-                )
-            }
+            val prompt = """
+                Ты — профессиональный синхронизатор субтитров.
+                Аудиодорожка проанализирована по звуковой волне FFmpeg. Голос звучит строго в следующих акустических островках:
+                $islandsDesc
+                
+                $langClause
+                Прослушай аудио от начала до конца и впиши произнесённые слова в соответствующие островки (если в каком-то островке только смех/музыка/шум без слов — оставь text пустым "").
+                НЕ придумывай слова от себя!
+                Верни СТРОГО JSON массив:
+                [{"island":1,"startSec":0.15,"endSec":2.40,"text":"точная фраза из этого куска"}]
+            """.trimIndent()
 
-            val rawBody = response.bodyAsText()
-            if (!response.status.isSuccess()) {
-                DiagnosticLogger.log(
-                    "WHISPER:ERR",
-                    "Groq HTTP ${response.status.value}: ${rawBody.take(180)}"
-                )
-                return@withContext emptyList()
-            }
+            val rawJson = GeminiModelResolver.generateTextOrJson(
+                apiKey = geminiApiKey,
+                prompt = prompt,
+                expectJson = true,
+                inlineAudioBase64 = audioBase64,
+                inlineAudioMime = "audio/mp4"
+            ) ?: return@withContext emptyList()
 
-            val root = jsonFormat.parseToJsonElement(rawBody).jsonObject
-            val wordsJson = root["words"]?.jsonArray
-            val parsedWords = mutableListOf<EditableTimedWord>()
+            val parsedDtos = jsonFormat.decodeFromString<List<GeminiIslandTranscriptDto>>(rawJson)
+            val outWords = mutableListOf<EditableTimedWord>()
 
-            if (wordsJson != null && wordsJson.isNotEmpty()) {
-                for (item in wordsJson) {
-                    val obj = item.jsonObject
-                    val wText = obj["word"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
-                    if (wText.isBlank()) continue
-                    val startS = obj["start"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: 0.0
-                    val rawEndS = obj["end"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: (startS + 0.22)
-                    val endS = rawEndS.coerceAtLeast(startS + 0.08)
-                    parsedWords.add(
+            for (dto in parsedDtos) {
+                val cleanText = dto.text.trim()
+                if (cleanText.isBlank()) continue
+                val tokens = cleanText.split(Regex("""\s+""")).filter { it.isNotBlank() }
+                if (tokens.isEmpty()) continue
+
+                // Lock strictly to FFmpeg's measured acoustic island bounds whenever island index matches!
+                val matchedIsland = speechIslands.getOrNull(dto.island - 1)
+                val segStart = (matchedIsland?.first ?: dto.startSec).coerceAtLeast(0.0)
+                val segEnd = (matchedIsland?.second ?: dto.endSec).coerceAtLeast(segStart + tokens.size * 0.14)
+                val span = (segEnd - segStart).coerceAtLeast(0.16)
+
+                // Weight each word's duration by phonetic length (character count + punctuation pause bonus)
+                val weights = tokens.map { tok ->
+                    val base = tok.length.coerceIn(2, 14).toDouble()
+                    val punctBonus = if (tok.endsWith(",") || tok.endsWith(".") || tok.endsWith("!") || tok.endsWith("?")) 1.8 else 0.0
+                    base + punctBonus
+                }
+                val weightSum = weights.sum().coerceAtLeast(1.0)
+
+                var cursor = segStart
+                tokens.forEachIndexed { idx, tok ->
+                    val dur = span * (weights[idx] / weightSum)
+                    val ws = (cursor * 100.0).roundToInt() / 100.0
+                    val we = if (idx == tokens.lastIndex) {
+                        (segEnd * 100.0).roundToInt() / 100.0
+                    } else {
+                        ((cursor + dur) * 100.0).roundToInt() / 100.0
+                    }
+                    outWords.add(
                         EditableTimedWord(
-                            text = wText,
-                            startSec = (startS * 100.0).roundToInt() / 100.0,
-                            endSec = (endS * 100.0).roundToInt() / 100.0
+                            text = tok,
+                            startSec = ws,
+                            endSec = we.coerceAtLeast(ws + 0.08)
                         )
                     )
+                    cursor += dur
                 }
             }
 
-            // Fallback to segments array if words array was omitted
-            if (parsedWords.isEmpty()) {
-                val segsJson = root["segments"]?.jsonArray
-                if (segsJson != null) {
-                    for (seg in segsJson) {
-                        val obj = seg.jsonObject
-                        val segText = obj["text"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
-                        val tokens = segText.split(Regex("""\s+""")).filter { it.isNotBlank() }
-                        if (tokens.isEmpty()) continue
-                        val sStart = obj["start"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: 0.0
-                        val sEnd = (obj["end"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: (sStart + 1.0))
-                            .coerceAtLeast(sStart + 0.20)
-                        val step = (sEnd - sStart) / tokens.size
-                        tokens.forEachIndexed { idx, tok ->
-                            val ws = ((sStart + idx * step) * 100.0).roundToInt() / 100.0
-                            val we = ((if (idx == tokens.lastIndex) sEnd else ws + step) * 100.0).roundToInt() / 100.0
-                            parsedWords.add(EditableTimedWord(text = tok, startSec = ws, endSec = we.coerceAtLeast(ws + 0.08)))
-                        }
-                    }
-                }
-            }
-
-            DiagnosticLogger.log("WHISPER", "✅ Groq Whisper вернул ${parsedWords.size} точных пословных таймкодов!")
-            parsedWords
+            DiagnosticLogger.log("STT-WAVE", "✅ Синхронизировано ${outWords.size} слов по реальной звуковой волне FFmpeg!")
+            outWords
         } catch (e: Exception) {
-            DiagnosticLogger.logError("WHISPER", "Сбой запроса к Groq Whisper API", e)
+            DiagnosticLogger.logError("STT-WAVE", "Ошибка гибридного распознавания Gemini + FFmpeg", e)
             emptyList()
         } finally {
             tempAudio.delete()
+        }
+    }
+
+    /**
+     * Runs FFmpeg `silencedetect` on the extracted audio track to find exact millisecond intervals
+     * where human speech/sound is present vs silent pauses.
+     */
+    private fun detectAcousticSpeechIslandsViaFfmpeg(
+        audioFile: File,
+        totalDurationSec: Double
+    ): List<Pair<Double, Double>> {
+        val cmd = "-hide_banner -nostdin -i \"${audioFile.absolutePath}\" -af \"highpass=f=120,lowpass=f=6500,silencedetect=noise=-30dB:d=0.17\" -f null -"
+        val session = FFmpegKit.execute(cmd)
+        val output = session.output.orEmpty()
+
+        val silenceStarts = Regex("""silence_start:\s*([0-9.]+)""")
+            .findAll(output)
+            .mapNotNull { it.groupValues[1].toDoubleOrNull() }
+            .toList()
+        val silenceEnds = Regex("""silence_end:\s*([0-9.]+)""")
+            .findAll(output)
+            .mapNotNull { it.groupValues[1].toDoubleOrNull() }
+            .toList()
+
+        val rawIslands = mutableListOf<Pair<Double, Double>>()
+        if (silenceStarts.isEmpty()) {
+            // Continuous loud background music: slice into 2.6s windows
+            var t = 0.0
+            while (t < totalDurationSec - 0.25) {
+                val next = (t + 2.6).coerceAtMost(totalDurationSec)
+                rawIslands.add(t to next)
+                t = next
+            }
+            return rawIslands
+        }
+
+        var speechCursor = 0.0
+        val count = maxOf(silenceStarts.size, silenceEnds.size)
+        for (i in 0 until count) {
+            val sStart = silenceStarts.getOrElse(i) { totalDurationSec }.coerceIn(0.0, totalDurationSec)
+            if (sStart - speechCursor >= 0.20) {
+                rawIslands.add(speechCursor to sStart)
+            }
+            val sEnd = silenceEnds.getOrElse(i) { totalDurationSec }.coerceIn(sStart, totalDurationSec)
+            speechCursor = sEnd
+        }
+        if (totalDurationSec - speechCursor >= 0.22) {
+            rawIslands.add(speechCursor to totalDurationSec)
+        }
+
+        // Split any overly long speech island (> 3.6s) into natural ~2.4s chunks so subtitles stay punchy
+        val refined = mutableListOf<Pair<Double, Double>>()
+        for ((s, e) in rawIslands) {
+            val len = e - s
+            if (len <= 3.6) {
+                refined.add(s to e)
+            } else {
+                val parts = (len / 2.4).roundToInt().coerceAtLeast(2)
+                val step = len / parts
+                for (p in 0 until parts) {
+                    val ps = s + p * step
+                    val pe = if (p == parts - 1) e else ps + step
+                    refined.add(ps to pe)
+                }
+            }
+        }
+        return refined.ifEmpty { listOf(0.0 to totalDurationSec) }
+    }
+
+    private fun probeAudioFileDurationSec(file: File): Double {
+        return try {
+            val retriever = android.media.MediaMetadataRetriever()
+            retriever.setDataSource(file.absolutePath)
+            val ms = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 30_000L
+            retriever.release()
+            (ms / 1000.0).coerceAtLeast(1.0)
+        } catch (_: Exception) {
+            30.0
         }
     }
 

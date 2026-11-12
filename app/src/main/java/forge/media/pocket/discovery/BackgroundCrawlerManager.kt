@@ -19,21 +19,18 @@ data class CrawlerJobState(
     val query: String = "",
     val platform: HuntPlatform = HuntPlatform.ALL,
     val pagesCrawled: Int = 0,
-    val targetCount: Int = 0, // 0 = infinite until STOP
-    val statusText: String = "Готов к поиску ссылок (без авто-скачивания мусора)",
+    val targetCount: Int = 0,
+    val statusText: String = "Готов к поиску свежих ссылок (просмотренные ролики и дубли скрываются автоматически)",
     val results: List<DiscoveredMediaCandidate> = emptyList()
 )
 
 /**
- * Application-wide Background Link-Only Crawler Coordinator.
+ * Application-wide Background Link-Only Crawler Coordinator v4.0.
  *
- * Survives UI tab switches and runs while the user minimizes the app (keeps PipelineForegroundService awake).
- * Strictly emits LINK CARDS ONLY — zero unsolicited MP4 downloads!
- *
- * 1) `sourceState`: Crawls pages across YouTube / VK / Pikabu / Reddit / Rutube until `targetCount` (e.g. 10/20/30)
- *    verified links are collected or user presses STOP.
- * 2) `bgState`: Infinite Background Harvester ("Искать фоны до СТОПА") — walks page 1, 2, 3...50+
- *    emitting live link cards until the user explicitly hits `⏹ СТОП`!
+ * - NEVER silently falls back from `За месяц` to `За всё время` (no 7–10 year old videos!).
+ * - Skips all previously shown results via `SearchBlacklistStore` so repeating a search always brings NEW videos.
+ * - Background Filler Harvester runs frame-by-frame mid-video inspection (ML Kit + Gemini Vision)
+ *   to reject cartoons, guides, menus, facecams, and story videos automatically.
  */
 object BackgroundCrawlerManager {
 
@@ -46,7 +43,7 @@ object BackgroundCrawlerManager {
     val sourceState: StateFlow<CrawlerJobState> = _sourceState.asStateFlow()
 
     private val _bgState = MutableStateFlow(
-        CrawlerJobState(statusText = "Введи тему фона (например Subway Surfers) и нажми «▶️ Искать до СТОПА»")
+        CrawlerJobState(statusText = "Введи тему наполнителя (например Subway Surfers или резка мыла) и нажми «▶️ Искать до СТОПА»")
     )
     val bgState: StateFlow<CrawlerJobState> = _bgState.asStateFlow()
 
@@ -59,7 +56,8 @@ object BackgroundCrawlerManager {
         period: SearchTimePeriod,
         durationMode: SearchDurationMode,
         languageMode: SearchLanguageMode,
-        targetCount: Int
+        targetCount: Int,
+        enableAiCuration: Boolean = true
     ) {
         val cleanQ = query.trim()
         if (cleanQ.isBlank()) return
@@ -80,7 +78,8 @@ object BackgroundCrawlerManager {
             period = period,
             durationMode = durationMode,
             languageMode = languageMode,
-            isBackgroundMode = false
+            isBackgroundMode = false,
+            enableAiCuration = enableAiCuration
         )
 
         _sourceState.value = CrawlerJobState(
@@ -89,7 +88,7 @@ object BackgroundCrawlerManager {
             platform = platform,
             pagesCrawled = 0,
             targetCount = targetCount,
-            statusText = "🚀 Сбор пачки $targetCount ссылок по запросу «$cleanQ» (работает в фоне)...",
+            statusText = "🧠 Ищу НОВЫЕ ролики «$cleanQ» (${period.label}) + проверяю кадры и массовую ЦА...",
             results = emptyList()
         )
 
@@ -97,44 +96,31 @@ object BackgroundCrawlerManager {
             val accumulated = mutableListOf<DiscoveredMediaCandidate>()
             var emptyStreak = 0
             try {
-                while (isActive && accumulated.size < targetCount && session.hasMorePages() && session.pageIndex < 25) {
+                while (isActive && accumulated.size < targetCount && session.hasMorePages() && session.pageIndex < 16) {
                     val pageItems = engine.crawlNextPage(session)
-                    if (pageItems.isEmpty()) {
+                    val trulyUnique = pageItems.filter { cand ->
+                        accumulated.none { prev ->
+                            prev.id == cand.id || SearchBlacklistStore.areTitlesNearDuplicates(prev.title, cand.title)
+                        }
+                    }
+
+                    if (trulyUnique.isEmpty()) {
                         emptyStreak++
-                        if (emptyStreak >= 3) break
+                        if (emptyStreak >= 4) break
                     } else {
                         emptyStreak = 0
-                        accumulated.addAll(pageItems)
+                        accumulated.addAll(trulyUnique)
                     }
 
                     val capped = accumulated.take(targetCount)
                     _sourceState.value = _sourceState.value.copy(
                         pagesCrawled = session.pageIndex,
                         results = capped,
-                        statusText = "🔎 Стр. #${session.pageIndex}: собрано ${capped.size} из $targetCount ссылок..."
+                        statusText = "🔎 Стр. #${session.pageIndex}: отобрано ${capped.size} из $targetCount свежих ссылок (без повторов и душнины)..."
                     )
 
                     if (capped.size >= targetCount) break
-                    delay(650L)
-                }
-
-                // Fallback to ALL_TIME if strict period returned 0
-                if (isActive && accumulated.isEmpty() && period != SearchTimePeriod.ALL_TIME) {
-                    _sourceState.value = _sourceState.value.copy(
-                        statusText = "За период «${period.label}» пусто -> проверяю за всё время..."
-                    )
-                    val fallbackSession = MultiPlatformCrawlSession(
-                        rawQuery = cleanQ,
-                        negativeTags = negativeTags,
-                        platform = platform,
-                        sortOrder = sortOrder,
-                        period = SearchTimePeriod.ALL_TIME,
-                        durationMode = durationMode,
-                        languageMode = languageMode,
-                        isBackgroundMode = false
-                    )
-                    val fbItems = engine.crawlNextPage(fallbackSession).take(targetCount)
-                    accumulated.addAll(fbItems)
+                    delay(450L)
                 }
 
                 val finalResults = accumulated.take(targetCount)
@@ -142,16 +128,16 @@ object BackgroundCrawlerManager {
                     isRunning = false,
                     results = finalResults,
                     statusText = if (finalResults.isNotEmpty()) {
-                        "✅ Собрано ${finalResults.size} ссылок (стр. ${session.pageIndex}). Выбирай нужные!"
+                        "✅ Найдено ${finalResults.size} новых роликов строго за «${period.label}» (без дублей и повторов)!"
                     } else {
-                        "⚠️ По запросу «$cleanQ» ссылок не найдено. Проверь минус-слова или площадку."
+                        "⚠️ За период «${period.label}» новых (не показанных ранее) роликов не осталось. Нажми «🔄 Сбросить просмотренные» или выбери «За год»."
                     }
                 )
             } catch (e: Exception) {
                 DiagnosticLogger.logError("SOURCE-CRAWLER", "Остановка пакетного поиска", e)
                 _sourceState.value = _sourceState.value.copy(
                     isRunning = false,
-                    statusText = "⏹ Поиск завершён (найдено ${_sourceState.value.results.size} ссылок)"
+                    statusText = "⏹ Поиск остановлен (найдено ${_sourceState.value.results.size} ссылок)"
                 )
             }
         }
@@ -166,11 +152,6 @@ object BackgroundCrawlerManager {
         )
     }
 
-    /**
-     * Module 4: Infinite Link-Only Background Harvester!
-     * Walks page 1, 2, 3 ... 60 continuously across platforms until the user hits `⏹ СТОП`.
-     * NEVER downloads any MP4 automatically — streams clickable link cards live!
-     */
     fun startInfiniteBackgroundCrawl(
         context: Context,
         query: String,
@@ -192,11 +173,12 @@ object BackgroundCrawlerManager {
             rawQuery = cleanQ,
             negativeTags = negativeTags,
             platform = platform,
-            sortOrder = ContentSortOrder.POPULAR,
+            sortOrder = ContentSortOrder.RELEVANCE,
             period = SearchTimePeriod.ALL_TIME,
-            durationMode = SearchDurationMode.ANY_UP_TO_6M,
+            durationMode = SearchDurationMode.ORIGINALS_1_TO_6M,
             languageMode = SearchLanguageMode.ANY_LANGUAGE,
-            isBackgroundMode = true
+            isBackgroundMode = true,
+            enableAiCuration = true
         )
 
         _bgState.value = CrawlerJobState(
@@ -205,7 +187,7 @@ object BackgroundCrawlerManager {
             platform = platform,
             pagesCrawled = 0,
             targetCount = 0,
-            statusText = "♾ Бесконечный поиск ссылок «$cleanQ» запущен! Иду по страницам до нажатия СТОП...",
+            statusText = "👁 Ищу чистые фоны-наполнители «$cleanQ» (покадровый отсев мультиков, гайдов и вебок)...",
             results = emptyList()
         )
 
@@ -213,11 +195,15 @@ object BackgroundCrawlerManager {
             val liveList = mutableListOf<DiscoveredMediaCandidate>()
             var emptyPagesInRow = 0
             try {
-                while (isActive && session.hasMorePages() && session.pageIndex < 80) {
-                    val freshLinks = engine.crawlNextPage(session)
+                while (isActive && session.hasMorePages() && session.pageIndex < 60) {
+                    val freshLinks = engine.crawlNextPage(session).filter { cand ->
+                        liveList.none { prev ->
+                            prev.id == cand.id || SearchBlacklistStore.areTitlesNearDuplicates(prev.title, cand.title)
+                        }
+                    }
                     if (freshLinks.isEmpty()) {
                         emptyPagesInRow++
-                        if (emptyPagesInRow >= 4) break
+                        if (emptyPagesInRow >= 5) break
                     } else {
                         emptyPagesInRow = 0
                         liveList.addAll(freshLinks)
@@ -226,20 +212,20 @@ object BackgroundCrawlerManager {
                     _bgState.value = _bgState.value.copy(
                         pagesCrawled = session.pageIndex,
                         results = liveList.toList(),
-                        statusText = "♾ Ищу фоны до СТОПА • Стр. #${session.pageIndex} • Найдено ссылок: ${liveList.size} шт."
+                        statusText = "♾ Покадровый поиск фонов • Стр. #${session.pageIndex} • Одобрено чистых наполнителей: ${liveList.size} шт."
                     )
-
-                    delay(1100L)
+                    delay(800L)
                 }
 
                 _bgState.value = _bgState.value.copy(
                     isRunning = false,
-                    statusText = "✅ Все доступные страницы пройдены (${liveList.size} ссылок по теме «$cleanQ»)"
+                    statusText = "✅ Поиск фонов завершён (стр. ${session.pageIndex}, чистых наполнителей: ${liveList.size} шт.)"
                 )
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                DiagnosticLogger.logError("BG-CRAWLER", "Остановка фонового краулера", e)
                 _bgState.value = _bgState.value.copy(
                     isRunning = false,
-                    statusText = "⏹ Поиск фонов остановлен (собрано ${_bgState.value.results.size} ссылок)"
+                    statusText = "⏹ Поиск фонов остановлен (чистых наполнителей: ${_bgState.value.results.size} шт.)"
                 )
             }
         }
@@ -250,35 +236,25 @@ object BackgroundCrawlerManager {
         bgInfiniteJob = null
         _bgState.value = _bgState.value.copy(
             isRunning = false,
-            statusText = "⏹ Остановлено по кнопке СТОП. Найдено ссылок: ${_bgState.value.results.size} шт."
+            statusText = "⏹ Поиск фонов остановлен пользователем (${_bgState.value.results.size} ссылок)"
         )
     }
 
-    /**
-     * Immediately purges a banned video or channel from both live result lists!
-     */
-    fun banCandidateAndPurge(context: Context, candidate: DiscoveredMediaCandidate, banEntireChannel: Boolean) {
-        if (banEntireChannel) {
+    fun banCandidateAndPurge(context: Context, candidate: DiscoveredMediaCandidate, banWholeChannel: Boolean) {
+        SearchBlacklistStore.banVideo(context, candidate.id, candidate.url, candidate.title)
+        if (banWholeChannel) {
             SearchBlacklistStore.banChannel(context, candidate.author)
-            val normBan = SearchBlacklistStore.normalizeAuthorKey(candidate.author)
-            _sourceState.value = _sourceState.value.copy(
-                results = _sourceState.value.results.filterNot {
-                    SearchBlacklistStore.normalizeAuthorKey(it.author) == normBan
-                }
-            )
-            _bgState.value = _bgState.value.copy(
-                results = _bgState.value.results.filterNot {
-                    SearchBlacklistStore.normalizeAuthorKey(it.author) == normBan
-                }
-            )
-        } else {
-            SearchBlacklistStore.banVideo(context, candidate.id, candidate.url, candidate.title)
-            _sourceState.value = _sourceState.value.copy(
-                results = _sourceState.value.results.filterNot { it.id == candidate.id || it.url == candidate.url }
-            )
-            _bgState.value = _bgState.value.copy(
-                results = _bgState.value.results.filterNot { it.id == candidate.id || it.url == candidate.url }
-            )
         }
+        val filterFn: (DiscoveredMediaCandidate) -> Boolean = { item ->
+            item.id != candidate.id &&
+                item.url != candidate.url &&
+                (!banWholeChannel || !item.author.equals(candidate.author, ignoreCase = true))
+        }
+        _sourceState.value = _sourceState.value.copy(
+            results = _sourceState.value.results.filter(filterFn)
+        )
+        _bgState.value = _bgState.value.copy(
+            results = _bgState.value.results.filter(filterFn)
+        )
     }
 }

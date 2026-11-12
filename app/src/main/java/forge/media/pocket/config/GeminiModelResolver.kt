@@ -179,7 +179,8 @@ object GeminiModelResolver {
         prompt: String,
         expectJson: Boolean,
         inlineAudioBase64: String? = null,
-        inlineAudioMime: String = "audio/mp4"
+        inlineAudioMime: String = "audio/mp4",
+        inlineImages: List<Pair<String, String>> = emptyList() // Pair<mimeType, base64Data>
     ): String? = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank()) return@withContext null
@@ -195,6 +196,18 @@ object GeminiModelResolver {
                         }
                     }
                 )
+            }
+            for ((mime, b64) in inlineImages) {
+                if (b64.isNotBlank()) {
+                    add(
+                        buildJsonObject {
+                            putJsonObject("inlineData") {
+                                put("mimeType", mime)
+                                put("data", b64)
+                            }
+                        }
+                    )
+                }
             }
             add(
                 buildJsonObject {

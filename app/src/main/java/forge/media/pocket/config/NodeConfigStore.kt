@@ -19,7 +19,7 @@ import java.util.concurrent.ConcurrentLinkedDeque
  */
 object DiagnosticLogger {
     private const val TAG = "PocketForgeDiag"
-    private const val MAX_MEMORY_LINES = 400
+    private const val MAX_MEMORY_LINES = 1500
 
     private val memoryLines = ConcurrentLinkedDeque<String>()
     private val _logFlow = MutableStateFlow<List<String>>(emptyList())
@@ -35,12 +35,12 @@ object DiagnosticLogger {
             val f = File(context.filesDir, "diagnostic_boot.log")
             logFile = f
             try {
-                if (f.exists() && f.length() > 512_000L) {
+                if (f.exists() && f.length() > 2_048_000L) {
                     f.writeText("")
                 }
             } catch (_: Exception) {
             }
-            log("BOOT", "=== ЗАПУСК СЕССИИ ЛОГИРОВАНИЯ POCKET MEDIA FORGE ===")
+            log("BOOT", "=== ЗАПУСК СЕССИИ ЛОГИРОВАНИЯ POCKET MEDIA FORGE v4.0 ===")
         }
     }
 
@@ -73,16 +73,22 @@ object DiagnosticLogger {
         log("$stage:ERR", "❌ $errDetail")
     }
 
-    fun getRecentLinesText(maxLines: Int = 45): String {
+    fun getRecentLinesText(maxLines: Int = 250): String {
         val list = memoryLines.toList()
         if (list.isEmpty()) return "Лог пока пуст."
         return list.takeLast(maxLines).joinToString("\n")
     }
 
+    fun getAllLinesText(): String {
+        val list = memoryLines.toList()
+        if (list.isEmpty()) return "Лог пока пуст."
+        return list.joinToString("\n")
+    }
+
     fun getFullLogFile(context: Context): File {
         val f = logFile ?: File(context.filesDir, "diagnostic_boot.log")
-        if (!f.exists()) {
-            f.writeText(getRecentLinesText(MAX_MEMORY_LINES))
+        if (!f.exists() || f.length() == 0L) {
+            f.writeText(getAllLinesText())
         }
         return f
     }

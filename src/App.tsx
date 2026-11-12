@@ -29,8 +29,7 @@ import geminiClientRaw from '../app/src/main/java/forge/media/pocket/telegram/Ge
 import telegramWorkerRaw from '../app/src/main/java/forge/media/pocket/telegram/TelegramBotWorker.kt?raw';
 import nodeConfigStoreRaw from '../app/src/main/java/forge/media/pocket/config/NodeConfigStore.kt?raw';
 import geminiModelResolverRaw from '../app/src/main/java/forge/media/pocket/config/GeminiModelResolver.kt?raw';
-import preEditorWorkbenchRaw from '../app/src/main/java/forge/media/pocket/ui/PreEditorWorkbenchScreen.kt?raw';
-import forgeAssemblerRaw from '../app/src/main/java/forge/media/pocket/ui/ForgeAssemblerScreen.kt?raw';
+import youCutStudioRaw from '../app/src/main/java/forge/media/pocket/ui/YouCutStudioScreen.kt?raw';
 import mainActivityRaw from '../app/src/main/java/forge/media/pocket/ui/MainActivity.kt?raw';
 
 interface ProjectFile {
@@ -172,35 +171,28 @@ const PROJECT_FILES: ProjectFile[] = [
     step: 6,
     path: 'app/src/main/java/forge/media/pocket/config/NodeConfigStore.kt',
     language: 'kotlin',
-    description: 'On-device credential store for Telegram Token, Groq Whisper API Key (gsk_...), Gemini Key, and Cookies.',
+    description: '1500-line DiagnosticLogger with full clipboard export + Gemini & Telegram credential store.',
     content: nodeConfigStoreRaw,
   },
   {
     step: 6,
     path: 'app/src/main/java/forge/media/pocket/config/GeminiModelResolver.kt',
     language: 'kotlin',
-    description: 'Resilient Gemini Flash & TTS model resolver with instant HTTP 404 retired-model circuit breaker.',
+    description: 'Multimodal Gemini Flash/Vision/Audio resolver supporting multi-frame JPEG strips and HTTP 404 circuit breaker.',
     content: geminiModelResolverRaw,
   },
   {
     step: 6,
-    path: 'app/src/main/java/forge/media/pocket/ui/PreEditorWorkbenchScreen.kt',
+    path: 'app/src/main/java/forge/media/pocket/ui/YouCutStudioScreen.kt',
     language: 'kotlin',
-    description: 'Stage 1 Pre-Editor (Media3 ExoPlayer 60fps): multi-cut timeline, chunk deletion, touch crop, multi-delogo.',
-    content: preEditorWorkbenchRaw,
-  },
-  {
-    step: 6,
-    path: 'app/src/main/java/forge/media/pocket/ui/ForgeAssemblerScreen.kt',
-    language: 'kotlin',
-    description: 'Stage 2 Assembler: Dual 9:16 ExoPlayer, Groq Whisper word/phrase editor, 4-ch audio mixer, TTS, FullHD export.',
-    content: forgeAssemblerRaw,
+    description: 'Unified Single-Screen YouCut Studio: scrollable Filmstrip timeline, trim handles, Pinch-to-Zoom/Pan, Undo/Redo, and FFmpeg+Gemini voice sync.',
+    content: youCutStudioRaw,
   },
   {
     step: 6,
     path: 'app/src/main/java/forge/media/pocket/ui/MainActivity.kt',
     language: 'kotlin',
-    description: 'Jetpack Compose root uniting Link-Only Search, 4-Step Studio Workflow, Pre-Editor, Assembler, and Blacklist.',
+    description: 'Compose v4.0 root uniting Gemini Frame-Curated Search, Single-Screen YouCut Studio, and 1500-line Copyable Log.',
     content: mainActivityRaw,
   },
 ];
@@ -208,7 +200,7 @@ const PROJECT_FILES: ProjectFile[] = [
 export default function App() {
   const [selectedStepFilter, setSelectedStepFilter] = useState<'all' | 1 | 2 | 3 | 4 | 5 | 6>('all');
   const [selectedFilePath, setSelectedFilePath] = useState<string>(
-    'app/src/main/java/forge/media/pocket/ui/ForgeAssemblerScreen.kt'
+    'app/src/main/java/forge/media/pocket/ui/YouCutStudioScreen.kt'
   );
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
 

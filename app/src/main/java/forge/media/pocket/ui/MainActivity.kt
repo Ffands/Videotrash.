@@ -1,6 +1,9 @@
 package forge.media.pocket.ui
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -22,13 +25,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -44,6 +48,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -51,6 +56,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -69,7 +75,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import forge.media.pocket.clutter.ClutterEntropyFilter
-import forge.media.pocket.clutter.StudioInboxItem
 import forge.media.pocket.compositor.FFmpegHardwareEngine
 import forge.media.pocket.config.DiagnosticLogger
 import forge.media.pocket.config.NodeConfigStore
@@ -89,28 +94,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.util.Locale
 
 private enum class MainBottomTab(val icon: String, val label: String) {
     SEARCH("🔎", "Поиск"),
-    PRE_EDITOR("✂️", "Разделка"),
-    ASSEMBLER("🎛", "Редактор"),
-    SETTINGS("⚙️", "Ключи и Бан")
+    STUDIO("🎬", "Студия YouCut"),
+    SETTINGS("⚙️", "Настройки и Лог")
 }
 
 private enum class SearchHubSubTab(val label: String) {
-    SOURCES_BATCH("🎬 Исходники (10–30 ссылок)"),
-    BG_UNTIL_STOP("♾ Фоны до СТОПА (Ссылки)")
+    SOURCES_BATCH("🎬 Исходники (Масс-ЦА)"),
+    BG_UNTIL_STOP("♾ Фоны-наполнители")
 }
-
-private data class WorkflowVideoPrompt(
-    val file: File,
-    val title: String,
-    val sourceUrl: String,
-    val role: PreEditTargetRole,
-    val recStartSec: Double = 0.0,
-    val recEndSec: Double = 0.0
-)
 
 class MainActivity : AppCompatActivity() {
 
@@ -118,7 +112,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         DiagnosticLogger.init(applicationContext)
         SearchBlacklistStore.ensureInit(applicationContext)
-        DiagnosticLogger.log("UI", "Открыт главный экран Pocket Media Forge v3.0 (Compose + Media3 + Whisper)")
+        DiagnosticLogger.log("UI", "Открыт главный экран Pocket Media Forge v4.0 (YouCut Studio + Gemini Frame Curator)")
 
         try {
             PipelineForegroundService.startService(applicationContext)
@@ -135,11 +129,11 @@ class MainActivity : AppCompatActivity() {
         setContent {
             val forgeDarkScheme = remember {
                 darkColorScheme(
-                    primary = Color(0xFF38BDF8),
-                    secondary = Color(0xFF10B981),
-                    background = Color(0xFF0B0D13),
+                    primary = Color(0xFFF97316),
+                    secondary = Color(0xFF38BDF8),
+                    background = Color(0xFF0A0C10),
                     surface = Color(0xFF141824),
-                    onPrimary = Color.Black,
+                    onPrimary = Color.White,
                     onBackground = Color.White,
                     onSurface = Color.White
                 )
@@ -180,11 +174,10 @@ private fun PocketMediaForgeRootApp(
         }
     }
 
-    // Request notification permission on Android 13+ so ForegroundService notification stays visible
     val notifPermLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-        onResult = {}
-    )
+        ActivityResultContracts.RequestPermission()
+    ) { }
+
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -194,189 +187,132 @@ private fun PocketMediaForgeRootApp(
     var currentTab by remember { mutableStateOf(MainBottomTab.SEARCH) }
     var searchSubTab by remember { mutableStateOf(SearchHubSubTab.SOURCES_BATCH) }
 
-    // -------------------------------------------------------------------------
-    // STAGE 1 (PRE-EDITOR) & STAGE 2 (MAIN ASSEMBLER) SHARED PIPELINE STATE
-    // -------------------------------------------------------------------------
-    var preEditFile by remember { mutableStateOf<File?>(null) }
-    var preEditTitle by remember { mutableStateOf("") }
-    var preEditSourceUrl by remember { mutableStateOf("") }
-    var preEditRole by remember { mutableStateOf(PreEditTargetRole.PRIMARY_SOURCE) }
-    var preEditRecStart by remember { mutableStateOf(0.0) }
-    var preEditRecEnd by remember { mutableStateOf(0.0) }
+    // Unified YouCut Studio State
+    var studioPrimaryFile by remember { mutableStateOf<File?>(null) }
+    var studioPrimaryTitle by remember { mutableStateOf("") }
+    var studioPrimaryUrl by remember { mutableStateOf("") }
+    var studioRecStartSec by remember { mutableDoubleStateOf(0.0) }
+    var studioRecEndSec by remember { mutableDoubleStateOf(0.0) }
 
-    var assemblerPrimaryFile by remember { mutableStateOf<File?>(null) }
-    var assemblerPrimaryTitle by remember { mutableStateOf("") }
-    var assemblerPrimaryUrl by remember { mutableStateOf("") }
-
-    var assemblerBgFile by remember { mutableStateOf<File?>(null) }
-    var assemblerBgTitle by remember { mutableStateOf("") }
-
+    var studioBgFile by remember { mutableStateOf<File?>(null) }
+    var studioBgTitle by remember { mutableStateOf("") }
     var importedVoiceoverFile by remember { mutableStateOf<File?>(null) }
 
-    // Workflow Choice Modal: "1. Выбрал исходник -> 2. Тебе предложили его переделать -> 3. Переделал -> в Редактор"
-    var pendingWorkflowPrompt by remember { mutableStateOf<WorkflowVideoPrompt?>(null) }
+    LaunchedEffect(Unit) {
+        val existingInbox = clutterFilter.listStudioInboxItems()
+        if (studioPrimaryFile == null && existingInbox.isNotEmpty()) {
+            val first = existingInbox.first()
+            studioPrimaryFile = first.videoFile
+            studioPrimaryTitle = first.title
+            studioPrimaryUrl = first.sourceUrl
+            studioRecStartSec = first.recommendedStartSec
+            studioRecEndSec = first.recommendedEndSec
+        }
+        val existingPool = clutterFilter.listLocalPoolClips()
+        if (studioBgFile == null && existingPool.isNotEmpty()) {
+            studioBgFile = existingPool.first()
+            studioBgTitle = existingPool.first().nameWithoutExtension
+        }
+    }
 
-    // Refresh counters for local inbox & background pool lists
-    var inboxRefreshTick by remember { mutableIntStateOf(0) }
-    var poolRefreshTick by remember { mutableIntStateOf(0) }
-    var downloadingCardId by remember { mutableStateOf<String?>(null) }
-
-    // -------------------------------------------------------------------------
-    // SYSTEM FILE / GALLERY PICKERS
-    // -------------------------------------------------------------------------
-    val pickSourceVideoLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+    // File pickers
+    val pickPrimaryVideoLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
             scope.launch {
-                try {
-                    val item = clutterFilter.importLocalUriToInbox(uri, "Видео с телефона")
-                    inboxRefreshTick++
-                    val vf = clutterFilter.getInboxVideoFile(item)
-                    pendingWorkflowPrompt = WorkflowVideoPrompt(
-                        file = vf,
-                        title = item.title,
-                        sourceUrl = item.sourceUrl,
-                        role = PreEditTargetRole.PRIMARY_SOURCE
-                    )
-                } catch (e: Exception) {
-                    showToastMsg("❌ Ошибка импорта видео: ${e.message}")
+                val saved = withContext(Dispatchers.IO) {
+                    val inboxDir = File(context.filesDir, "studio_inbox").apply { mkdirs() }
+                    val out = File(inboxDir, "phone_src_${System.currentTimeMillis()}.mp4")
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        out.outputStream().use { output -> input.copyTo(output) }
+                    }
+                    if (out.exists() && out.length() > 1024L) out else null
+                }
+                if (saved != null) {
+                    studioPrimaryFile = saved
+                    studioPrimaryTitle = saved.nameWithoutExtension
+                    studioPrimaryUrl = ""
+                    studioRecStartSec = 0.0
+                    studioRecEndSec = 0.0
+                    currentTab = MainBottomTab.STUDIO
+                    showToastMsg("🎬 Видео открыто на 1-й дорожке YouCut!")
                 }
             }
         }
     }
 
     val pickBgVideoLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
             scope.launch {
-                try {
-                    showToastMsg("⏳ Добавляю фон с телефона в список фонов...")
-                    val added = clutterFilter.importLocalUriToPool(uri, "#свой_фон")
-                    poolRefreshTick++
-                    pendingWorkflowPrompt = WorkflowVideoPrompt(
-                        file = added,
-                        title = added.name,
-                        sourceUrl = "local://pool",
-                        role = PreEditTargetRole.BACKGROUND_CLIP
-                    )
-                } catch (e: Exception) {
-                    showToastMsg("❌ Ошибка импорта фона: ${e.message}")
+                val saved = withContext(Dispatchers.IO) {
+                    val poolDir = clutterFilter.getPoolDir()
+                    val out = File(poolDir, "filler_${System.currentTimeMillis()}.mp4")
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        out.outputStream().use { output -> input.copyTo(output) }
+                    }
+                    if (out.exists() && out.length() > 1024L) out else null
+                }
+                if (saved != null) {
+                    studioBgFile = saved
+                    studioBgTitle = saved.nameWithoutExtension
+                    currentTab = MainBottomTab.STUDIO
+                    showToastMsg("🕹 Фон добавлен на 2-ю дорожку YouCut!")
                 }
             }
         }
     }
 
     val pickVoiceoverAudioLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
             scope.launch {
-                try {
-                    val f = subtitleTransformer.importCustomVoiceoverUri(uri)
-                    importedVoiceoverFile = f
-                    showToastMsg("✅ Аудиофайл озвучки подключён: ${f.name}")
-                } catch (e: Exception) {
-                    showToastMsg("❌ Ошибка загрузки аудио: ${e.message}")
+                val saved = withContext(Dispatchers.IO) {
+                    val out = File(context.cacheDir, "custom_vo_${System.currentTimeMillis()}.mp3")
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        out.outputStream().use { output -> input.copyTo(output) }
+                    }
+                    if (out.exists() && out.length() > 500L) out else null
+                }
+                if (saved != null) {
+                    importedVoiceoverFile = saved
+                    showToastMsg("✅ Аудиофайл озвучки подключён")
                 }
             }
         }
     }
 
     val pickCookiesLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            scope.launch(Dispatchers.IO) {
-                try {
+            scope.launch {
+                val ok = withContext(Dispatchers.IO) {
                     val out = File(context.filesDir, "youtube_cookies.txt")
                     context.contentResolver.openInputStream(uri)?.use { input ->
-                        out.outputStream().use { o -> input.copyTo(o) }
+                        out.outputStream().use { output -> input.copyTo(output) }
                     }
-                    withContext(Dispatchers.Main) {
-                        showToastMsg("✅ youtube_cookies.txt загружен (${out.length() / 1024} KB)")
-                    }
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        showToastMsg("❌ Ошибка cookies: ${e.message}")
-                    }
+                    out.exists() && out.length() > 20L
                 }
+                if (ok) showToastMsg("🍪 cookies.txt сохранён!")
             }
         }
     }
 
-    // -------------------------------------------------------------------------
-    // STEP 2 PROMPT DIALOG: PRE-EDIT FIRST OR SEND STRAIGHT TO ASSEMBLER?
-    // -------------------------------------------------------------------------
-    pendingWorkflowPrompt?.let { prompt ->
-        AlertDialog(
-            onDismissRequest = { pendingWorkflowPrompt = null },
-            title = {
-                Text(
-                    text = if (prompt.role == PreEditTargetRole.PRIMARY_SOURCE) {
-                        "🎬 Исходник выбран: ${prompt.title}"
-                    } else {
-                        "🕹 Фон выбран: ${prompt.title}"
-                    },
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold
-                )
-            },
-            text = {
-                Text(
-                    text = "Хочешь сначала переделать и почистить его в «✂️ Разделке» (вырезать лишние куски, скадрировать, убрать чужое лого) — или закинуть сразу в Главный Редактор?",
-                    fontSize = 14.sp
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        pendingWorkflowPrompt = null
-                        preEditFile = prompt.file
-                        preEditTitle = prompt.title
-                        preEditSourceUrl = prompt.sourceUrl
-                        preEditRole = prompt.role
-                        preEditRecStart = prompt.recStartSec
-                        preEditRecEnd = prompt.recEndSec
-                        currentTab = MainBottomTab.PRE_EDITOR
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD97706))
-                ) {
-                    Text("✂️ Сначала переделать", color = Color.White, fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                OutlinedButton(
-                    onClick = {
-                        pendingWorkflowPrompt = null
-                        if (prompt.role == PreEditTargetRole.PRIMARY_SOURCE) {
-                            assemblerPrimaryFile = prompt.file
-                            assemblerPrimaryTitle = prompt.title
-                            assemblerPrimaryUrl = prompt.sourceUrl
-                        } else {
-                            assemblerBgFile = prompt.file
-                            assemblerBgTitle = prompt.title
-                        }
-                        currentTab = MainBottomTab.ASSEMBLER
-                    }
-                ) {
-                    Text("⚡ Сразу в Редактор")
-                }
-            }
-        )
-    }
-
     Scaffold(
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
+        containerColor = Color(0xFF0A0C10),
         bottomBar = {
-            NavigationBar(containerColor = Color(0xFF111520)) {
+            NavigationBar(containerColor = Color(0xFF11141D)) {
                 MainBottomTab.entries.forEach { tab ->
                     NavigationBarItem(
                         selected = currentTab == tab,
                         onClick = { currentTab = tab },
                         icon = { Text(tab.icon, fontSize = 18.sp) },
-                        label = { Text(tab.label, fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
+                        label = { Text(tab.label, fontSize = 11.sp, maxLines = 1) }
                     )
                 }
             }
@@ -386,206 +322,71 @@ private fun PocketMediaForgeRootApp(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .background(Color(0xFF0B0D13))
         ) {
             when (currentTab) {
                 MainBottomTab.SEARCH -> {
                     SearchAndLibraryHubScreen(
-                        subTab = searchSubTab,
-                        onSubTabChange = { searchSubTab = it },
+                        activeSubTab = searchSubTab,
+                        onChangeSubTab = { searchSubTab = it },
                         clutterFilter = clutterFilter,
-                        inboxRefreshTick = inboxRefreshTick,
-                        poolRefreshTick = poolRefreshTick,
-                        downloadingCardId = downloadingCardId,
-                        onPickLocalSource = { pickSourceVideoLauncher.launch("video/*") },
+                        onLoadSourceIntoStudio = { file, title, url, sSec, eSec ->
+                            studioPrimaryFile = file
+                            studioPrimaryTitle = title
+                            studioPrimaryUrl = url
+                            studioRecStartSec = sSec
+                            studioRecEndSec = eSec
+                            currentTab = MainBottomTab.STUDIO
+                            showToastMsg("🎬 Ролик загружен на 1-ю дорожку Студии YouCut!")
+                        },
+                        onLoadBackgroundIntoStudio = { file, title ->
+                            studioBgFile = file
+                            studioBgTitle = title
+                            showToastMsg("🕹 Чистый фон добавлен в пул и на 2-ю дорожку Студии!")
+                        },
+                        onPickLocalPrimary = { pickPrimaryVideoLauncher.launch("video/*") },
                         onPickLocalBackground = { pickBgVideoLauncher.launch("video/*") },
-                        onDownloadSourceCandidate = { cand ->
-                            downloadingCardId = cand.id
-                            scope.launch {
-                                try {
-                                    showToastMsg("📥 Качаю в 1080p: ${cand.title.take(40)}...")
-                                    val item = clutterFilter.downloadSourceToStudioInbox(
-                                        sourceUrl = cand.url,
-                                        overrideTitle = cand.title,
-                                        overrideAuthor = cand.author,
-                                        maxDurationSec = 720
-                                    )
-                                    inboxRefreshTick++
-                                    downloadingCardId = null
-                                    val vf = clutterFilter.getInboxVideoFile(item)
-                                    pendingWorkflowPrompt = WorkflowVideoPrompt(
-                                        file = vf,
-                                        title = item.title,
-                                        sourceUrl = item.sourceUrl,
-                                        role = PreEditTargetRole.PRIMARY_SOURCE
-                                    )
-                                } catch (e: Exception) {
-                                    downloadingCardId = null
-                                    showToastMsg("❌ Не удалось скачать: ${e.message?.take(120)}")
-                                }
-                            }
-                        },
-                        onDownloadDirectUrl = { rawUrl, asBackground ->
-                            downloadingCardId = "direct_url"
-                            scope.launch {
-                                try {
-                                    if (asBackground) {
-                                        showToastMsg("⏳ Скачиваю ролик в список фонов...")
-                                        val bgF = clutterFilter.downloadUrlToPoolWithTags(rawUrl, "#ссылка", "Фон по ссылке")
-                                        poolRefreshTick++
-                                        downloadingCardId = null
-                                        pendingWorkflowPrompt = WorkflowVideoPrompt(
-                                            file = bgF,
-                                            title = bgF.name,
-                                            sourceUrl = rawUrl,
-                                            role = PreEditTargetRole.BACKGROUND_CLIP
-                                        )
-                                    } else {
-                                        showToastMsg("📥 Скачиваю исходник 1080p по ссылке...")
-                                        val item = clutterFilter.downloadSourceToStudioInbox(rawUrl, maxDurationSec = 720)
-                                        inboxRefreshTick++
-                                        downloadingCardId = null
-                                        val vf = clutterFilter.getInboxVideoFile(item)
-                                        pendingWorkflowPrompt = WorkflowVideoPrompt(
-                                            file = vf,
-                                            title = item.title,
-                                            sourceUrl = item.sourceUrl,
-                                            role = PreEditTargetRole.PRIMARY_SOURCE
-                                        )
-                                    }
-                                } catch (e: Exception) {
-                                    downloadingCardId = null
-                                    showToastMsg("❌ Ошибка ссылки: ${e.message?.take(120)}")
-                                }
-                            }
-                        },
-                        onDownloadBgCandidateToPool = { cand, bgTopic ->
-                            downloadingCardId = cand.id
-                            scope.launch {
-                                try {
-                                    showToastMsg("⏳ Скачиваю выбранный фон в список фонов...")
-                                    val bgF = clutterFilter.downloadUrlToPoolWithTags(
-                                        sourceUrl = cand.url,
-                                        rawTagsInput = bgTopic,
-                                        customTitle = cand.title
-                                    )
-                                    poolRefreshTick++
-                                    downloadingCardId = null
-                                    pendingWorkflowPrompt = WorkflowVideoPrompt(
-                                        file = bgF,
-                                        title = cand.title,
-                                        sourceUrl = cand.url,
-                                        role = PreEditTargetRole.BACKGROUND_CLIP
-                                    )
-                                } catch (e: Exception) {
-                                    downloadingCardId = null
-                                    showToastMsg("❌ Ошибка скачивания фона: ${e.message?.take(120)}")
-                                }
-                            }
-                        },
-                        onOpenDownloadedInboxItem = { item ->
-                            val vf = clutterFilter.getInboxVideoFile(item)
-                            pendingWorkflowPrompt = WorkflowVideoPrompt(
-                                file = vf,
-                                title = item.title,
-                                sourceUrl = item.sourceUrl,
-                                role = PreEditTargetRole.PRIMARY_SOURCE,
-                                recStartSec = item.recommendedStartSec,
-                                recEndSec = item.recommendedEndSec
-                            )
-                        },
-                        onDeleteInboxItem = { item ->
-                            clutterFilter.deleteStudioInboxItem(item.id)
-                            inboxRefreshTick++
-                        },
-                        onOpenPoolClip = { file, title ->
-                            pendingWorkflowPrompt = WorkflowVideoPrompt(
-                                file = file,
-                                title = title,
-                                sourceUrl = "local://pool",
-                                role = PreEditTargetRole.BACKGROUND_CLIP
-                            )
-                        },
-                        onDeletePoolClip = { fileName ->
-                            clutterFilter.deletePoolClip(fileName)
-                            poolRefreshTick++
-                        },
                         onShowMessage = ::showToastMsg
                     )
                 }
 
-                MainBottomTab.PRE_EDITOR -> {
-                    PreEditorWorkbenchScreen(
-                        inputFile = preEditFile,
-                        clipTitle = preEditTitle,
-                        targetRole = preEditRole,
-                        initialRecommendedStartSec = preEditRecStart,
-                        initialRecommendedEndSec = preEditRecEnd,
-                        hardwareEngine = hardwareEngine,
-                        onPickVideoRequested = { pickSourceVideoLauncher.launch("video/*") },
-                        onChangeTargetRole = { preEditRole = it },
-                        onBakeFinishedToAssembler = { bakedFile, role, title ->
-                            if (role == PreEditTargetRole.PRIMARY_SOURCE) {
-                                assemblerPrimaryFile = bakedFile
-                                assemblerPrimaryTitle = "$title (Разделан)"
-                                assemblerPrimaryUrl = preEditSourceUrl
-                                showToastMsg("✅ Основное видео закинуто в Редактор! Теперь выбери фон из списка.")
-                            } else {
-                                assemblerBgFile = bakedFile
-                                assemblerBgTitle = "$title (Фон)"
-                                showToastMsg("✅ Фоновое видео закинуто во 2-й слот Редактора!")
-                            }
-                            currentTab = MainBottomTab.ASSEMBLER
-                        },
-                        onShowMessage = ::showToastMsg
-                    )
-                }
-
-                MainBottomTab.ASSEMBLER -> {
-                    ForgeAssemblerScreen(
-                        primaryFile = assemblerPrimaryFile,
-                        primaryTitle = assemblerPrimaryTitle,
-                        primarySourceUrl = assemblerPrimaryUrl,
-                        backgroundFile = assemblerBgFile,
-                        backgroundTitle = assemblerBgTitle,
+                MainBottomTab.STUDIO -> {
+                    YouCutStudioScreen(
+                        primaryFile = studioPrimaryFile,
+                        primaryTitle = studioPrimaryTitle,
+                        primarySourceUrl = studioPrimaryUrl,
+                        initialStartSec = studioRecStartSec,
+                        initialEndSec = studioRecEndSec,
+                        backgroundFile = studioBgFile,
+                        backgroundTitle = studioBgTitle,
                         clutterFilter = clutterFilter,
                         hardwareEngine = hardwareEngine,
                         faceHelper = faceHelper,
                         subtitleTransformer = subtitleTransformer,
-                        onPickPrimarySourceRequested = {
-                            searchSubTab = SearchHubSubTab.SOURCES_BATCH
+                        onPickPrimaryVideoFromPhone = { pickPrimaryVideoLauncher.launch("video/*") },
+                        onSelectPrimaryFromInbox = { f, t, u ->
+                            studioPrimaryFile = f
+                            studioPrimaryTitle = t
+                            studioPrimaryUrl = u
+                            studioRecStartSec = 0.0
+                            studioRecEndSec = 0.0
+                        },
+                        onSelectBackgroundFile = { bf, bt ->
+                            studioBgFile = bf
+                            studioBgTitle = bt
+                        },
+                        onPickBackgroundFromPhone = { pickBgVideoLauncher.launch("video/*") },
+                        onJumpToSearchTab = { forBg ->
+                            searchSubTab = if (forBg) SearchHubSubTab.BG_UNTIL_STOP else SearchHubSubTab.SOURCES_BATCH
                             currentTab = MainBottomTab.SEARCH
                         },
-                        onSendClipToPreEditor = { file, title, role ->
-                            preEditFile = file
-                            preEditTitle = title
-                            preEditRole = role
-                            preEditRecStart = 0.0
-                            preEditRecEnd = 0.0
-                            currentTab = MainBottomTab.PRE_EDITOR
-                        },
-                        onSelectBackgroundDirectly = { bgF, bgT ->
-                            assemblerBgFile = bgF
-                            assemblerBgTitle = bgT
-                            showToastMsg("✅ Фон «$bgT» подключён к Сборщику!")
-                        },
-                        onImportBackgroundFromGalleryRequested = {
-                            pickBgVideoLauncher.launch("video/*")
-                        },
-                        onJumpToBackgroundSearchRequested = {
-                            searchSubTab = SearchHubSubTab.BG_UNTIL_STOP
-                            currentTab = MainBottomTab.SEARCH
-                        },
-                        onImportCustomVoiceoverRequested = {
-                            pickVoiceoverAudioLauncher.launch("audio/*")
-                        },
-                        importedCustomVoiceoverFile = importedVoiceoverFile,
+                        onImportVoiceoverAudio = { pickVoiceoverAudioLauncher.launch("audio/*") },
+                        importedVoiceoverFile = importedVoiceoverFile,
                         onShowMessage = ::showToastMsg
                     )
                 }
 
                 MainBottomTab.SETTINGS -> {
-                    SettingsAndBlacklistScreen(
+                    SettingsAndLogScreen(
                         configStore = configStore,
                         powerHelper = powerHelper,
                         onPickCookiesFile = { pickCookiesLauncher.launch("*/*") },
@@ -597,161 +398,145 @@ private fun PocketMediaForgeRootApp(
     }
 }
 
-// =============================================================================
-// TAB 1: MULTI-PLATFORM LINK-ONLY SEARCH HUB + INFINITE BG HARVESTER + INBOX
-// =============================================================================
+// =========================================================================
+// TAB 1: MULTI-PLATFORM LINK-ONLY SEARCH + GEMINI FRAME CURATOR
+// =========================================================================
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SearchAndLibraryHubScreen(
-    subTab: SearchHubSubTab,
-    onSubTabChange: (SearchHubSubTab) -> Unit,
+    activeSubTab: SearchHubSubTab,
+    onChangeSubTab: (SearchHubSubTab) -> Unit,
     clutterFilter: ClutterEntropyFilter,
-    inboxRefreshTick: Int,
-    poolRefreshTick: Int,
-    downloadingCardId: String?,
-    onPickLocalSource: () -> Unit,
+    onLoadSourceIntoStudio: (File, String, String, Double, Double) -> Unit,
+    onLoadBackgroundIntoStudio: (File, String) -> Unit,
+    onPickLocalPrimary: () -> Unit,
     onPickLocalBackground: () -> Unit,
-    onDownloadSourceCandidate: (DiscoveredMediaCandidate) -> Unit,
-    onDownloadDirectUrl: (url: String, asBackground: Boolean) -> Unit,
-    onDownloadBgCandidateToPool: (DiscoveredMediaCandidate, String) -> Unit,
-    onOpenDownloadedInboxItem: (StudioInboxItem) -> Unit,
-    onDeleteInboxItem: (StudioInboxItem) -> Unit,
-    onOpenPoolClip: (File, String) -> Unit,
-    onDeletePoolClip: (String) -> Unit,
     onShowMessage: (String) -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
     val sourceJobState by BackgroundCrawlerManager.sourceState.collectAsState()
     val bgJobState by BackgroundCrawlerManager.bgState.collectAsState()
     val savedSourceNeg by SearchBlacklistStore.sourceNegativeTags.collectAsState()
     val savedBgNeg by SearchBlacklistStore.bgNegativeTags.collectAsState()
+    val seenHistoryCount by SearchBlacklistStore.seenCount.collectAsState()
 
-    // Source search form state
-    var sourceQuery by remember { mutableStateOf("стендап монологи") }
+    var sourceQuery by remember { mutableStateOf("Стендап про отношения") }
     var sourceNegInput by remember(savedSourceNeg) { mutableStateOf(savedSourceNeg) }
     var sourcePlatform by remember { mutableStateOf(HuntPlatform.ALL) }
-    var sourceSort by remember { mutableStateOf(ContentSortOrder.POPULAR) }
     var sourcePeriod by remember { mutableStateOf(SearchTimePeriod.MONTH) }
-    var sourceDuration by remember { mutableStateOf(SearchDurationMode.ANY_UP_TO_6M) }
+    var sourceDuration by remember { mutableStateOf(SearchDurationMode.SHORTS_ONLY) }
     var sourceLanguage by remember { mutableStateOf(SearchLanguageMode.RUSSIAN_ONLY) }
-    var sourceTargetCount by remember { mutableIntStateOf(20) }
+    var sourceSort by remember { mutableStateOf(ContentSortOrder.POPULAR) }
+    var sourceTargetCount by remember { mutableIntStateOf(10) }
+    var enableAiAudienceFilter by remember { mutableStateOf(true) }
     var directUrlInput by remember { mutableStateOf("") }
 
-    // Background infinite harvester form state
     var bgQuery by remember { mutableStateOf("Subway Surfers") }
     var bgNegInput by remember(savedBgNeg) { mutableStateOf(savedBgNeg) }
-    var bgPlatform by remember { mutableStateOf(HuntPlatform.ALL) }
+    var bgPlatform by remember { mutableStateOf(HuntPlatform.YOUTUBE) }
 
-    val inboxItems = remember(inboxRefreshTick) { clutterFilter.listStudioInboxItems() }
-    val poolClips = remember(poolRefreshTick) { clutterFilter.listVerifiedPoolClips() }
+    var downloadingCardId by remember { mutableStateOf<String?>(null) }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(12.dp)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // Sub-tab switcher: Sources Batch vs Infinite Background Harvester
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            SearchHubSubTab.entries.forEach { st ->
-                FilterChip(
-                    selected = subTab == st,
-                    onClick = { onSubTabChange(st) },
-                    label = { Text(st.label, fontSize = 12.sp, fontWeight = FontWeight.Bold) },
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            SearchHubSubTab.entries.forEach { tab ->
+                val sel = activeSubTab == tab
+                Button(
+                    onClick = { onChangeSubTab(tab) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (sel) Color(0xFFF97316) else Color(0xFF1A2030),
+                        contentColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(10.dp),
                     modifier = Modifier.weight(1f)
-                )
+                ) {
+                    Text(tab.label, fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                }
             }
         }
 
-        Spacer(Modifier.height(8.dp))
-
-        if (subTab == SearchHubSubTab.SOURCES_BATCH) {
-            // Quick Direct Import Bar (Gallery + Direct Link)
+        if (activeSubTab == SearchHubSubTab.SOURCES_BATCH) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF141824)),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Column(modifier = Modifier.padding(10.dp)) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Button(
-                            onClick = onPickLocalSource,
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4F46E5)),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("📱 Видео с телефона", fontSize = 12.sp)
-                        }
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedTextField(
-                            value = directUrlInput,
-                            onValueChange = { directUrlInput = it },
-                            label = { Text("Прямая ссылка (YT / VK / Pikabu / Reddit / Rutube)", fontSize = 11.sp) },
-                            singleLine = true,
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "🎯 Поиск для массовой ЦА (без дублей и повторов)",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
                             modifier = Modifier.weight(1f)
                         )
-                        Button(
-                            onClick = {
-                                if (directUrlInput.startsWith("http")) {
-                                    onDownloadDirectUrl(directUrlInput.trim(), false)
-                                    directUrlInput = ""
-                                } else {
-                                    onShowMessage("Вставь корректную ссылку https://...")
+                        if (seenHistoryCount > 0) {
+                            TextButton(
+                                onClick = {
+                                    SearchBlacklistStore.clearSeenHistory(context)
+                                    onShowMessage("🔄 Память просмотренных сброшена")
                                 }
-                            },
-                            enabled = downloadingCardId == null
-                        ) {
-                            Text("⬇️", fontSize = 14.sp)
+                            ) {
+                                Text("🔄 Сброс ($seenHistoryCount)", fontSize = 11.sp, color = Color(0xFF93C5FD))
+                            }
                         }
                     }
-                }
-            }
-
-            Spacer(Modifier.height(10.dp))
-
-            // Multi-Platform Link-Only Batch Crawler Configurator
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF141824)),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text(
-                        text = "🔎 Пакетный поиск ссылок (без авто-скачивания мусора)",
-                        color = Color.White,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(Modifier.height(6.dp))
 
                     OutlinedTextField(
                         value = sourceQuery,
                         onValueChange = { sourceQuery = it },
-                        label = { Text("Точный запрос (например: стендап истории, подкаст, cs2 клатчи)") },
+                        label = { Text("Тема (напр. Стендап про отношения, Смешная история)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Spacer(Modifier.height(6.dp))
 
                     OutlinedTextField(
                         value = sourceNegInput,
-                        onValueChange = { sourceNegInput = it },
-                        label = { Text("Минус-слова (отсеять мусор: -концерт -стрим -реакция)") },
+                        onValueChange = {
+                            sourceNegInput = it
+                            SearchBlacklistStore.setSourceNegativeTags(context, it)
+                        },
+                        label = { Text("Минус-слова (отсечь душнину и концерты)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
 
-                    Spacer(Modifier.height(8.dp))
-                    Text("Площадки:", color = Color(0xFF93C5FD), fontSize = 11.sp)
                     Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "🧠 Фейсконтроль Gemini + проверка кадров",
+                                color = Color(0xFFFDE68A),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                "Отсекает бизнес-стендапы, 15с пустышки, статьи и баяны",
+                                color = Color(0xFF9CA3AF),
+                                fontSize = 10.sp
+                            )
+                        }
+                        Switch(checked = enableAiAudienceFilter, onCheckedChange = { enableAiAudienceFilter = it })
+                    }
+
+                    Text("Площадка:", color = Color(0xFF9CA3AF), fontSize = 11.sp)
+                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         HuntPlatform.entries.forEach { p ->
                             FilterChip(
                                 selected = sourcePlatform == p,
@@ -761,72 +546,44 @@ private fun SearchAndLibraryHubScreen(
                         }
                     }
 
-                    Text("Период и Хронометраж:", color = Color(0xFF93C5FD), fontSize = 11.sp)
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        SearchTimePeriod.entries.forEach { per ->
-                            FilterChip(
-                                selected = sourcePeriod == per,
-                                onClick = { sourcePeriod = per },
-                                label = { Text(per.label, fontSize = 11.sp) }
-                            )
-                        }
-                    }
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
+                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         SearchDurationMode.entries.forEach { dm ->
                             FilterChip(
                                 selected = sourceDuration == dm,
                                 onClick = { sourceDuration = dm },
-                                label = { Text(dm.label.substringBefore(" ("), fontSize = 11.sp) }
+                                label = { Text(dm.label, fontSize = 11.sp) }
                             )
                         }
                     }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            listOf(10, 20, 30).forEach { cnt ->
-                                FilterChip(
-                                    selected = sourceTargetCount == cnt,
-                                    onClick = { sourceTargetCount = cnt },
-                                    label = { Text("$cnt ссылок", fontSize = 11.sp) }
-                                )
-                            }
+                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        SearchTimePeriod.entries.forEach { tp ->
+                            FilterChip(
+                                selected = sourcePeriod == tp,
+                                onClick = { sourcePeriod = tp },
+                                label = { Text(tp.label, fontSize = 11.sp) }
+                            )
                         }
-                        FilterChip(
-                            selected = sourceLanguage == SearchLanguageMode.ANY_LANGUAGE,
-                            onClick = {
-                                sourceLanguage = when (sourceLanguage) {
-                                    SearchLanguageMode.RUSSIAN_ONLY -> SearchLanguageMode.ENGLISH_FOR_DUB
-                                    SearchLanguageMode.ENGLISH_FOR_DUB -> SearchLanguageMode.ANY_LANGUAGE
-                                    SearchLanguageMode.ANY_LANGUAGE -> SearchLanguageMode.RUSSIAN_ONLY
-                                }
-                            },
-                            label = { Text(sourceLanguage.label, fontSize = 11.sp) }
-                        )
                     }
 
-                    Spacer(Modifier.height(8.dp))
-
-                    if (sourceJobState.isRunning) {
-                        Button(
-                            onClick = { BackgroundCrawlerManager.stopSourceBatchCrawl() },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
-                            modifier = Modifier.fillMaxWidth().height(46.dp)
-                        ) {
-                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = Color.White)
-                            Spacer(Modifier.width(8.dp))
-                            Text("⏹ ОСТАНОВИТЬ СБОР (${sourceJobState.results.size}/$sourceTargetCount)", fontWeight = FontWeight.Bold)
+                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        SearchLanguageMode.entries.forEach { lm ->
+                            FilterChip(
+                                selected = sourceLanguage == lm,
+                                onClick = { sourceLanguage = lm },
+                                label = { Text(lm.label, fontSize = 11.sp) }
+                            )
                         }
-                    } else {
+                        listOf(10, 20, 30).forEach { cnt ->
+                            FilterChip(
+                                selected = sourceTargetCount == cnt,
+                                onClick = { sourceTargetCount = cnt },
+                                label = { Text("$cnt шт.", fontSize = 11.sp) }
+                            )
+                        }
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                         Button(
                             onClick = {
                                 BackgroundCrawlerManager.startSourceBatchCrawl(
@@ -838,419 +595,339 @@ private fun SearchAndLibraryHubScreen(
                                     period = sourcePeriod,
                                     durationMode = sourceDuration,
                                     languageMode = sourceLanguage,
-                                    targetCount = sourceTargetCount
+                                    targetCount = sourceTargetCount,
+                                    enableAiCuration = enableAiAudienceFilter
                                 )
                             },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
-                            modifier = Modifier.fillMaxWidth().height(46.dp)
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF97316)),
+                            modifier = Modifier.weight(1f)
                         ) {
-                            Text(
-                                "🚀 СОБРАТЬ $sourceTargetCount ССЫЛОК В ФОНЕ",
-                                color = Color.Black,
-                                fontWeight = FontWeight.ExtraBold
+                            Text("🚀 Найти НОВЫЕ ($sourceTargetCount ссылок)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+
+                        if (sourceJobState.isRunning) {
+                            Button(
+                                onClick = { BackgroundCrawlerManager.stopSourceBatchCrawl() },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
+                            ) {
+                                Text("⏹ СТОП", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        }
+                    }
+
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (sourceJobState.isRunning) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color(0xFFF97316))
+                        }
+                        Text(sourceJobState.statusText, color = Color(0xFF93C5FD), fontSize = 11.sp)
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = directUrlInput,
+                            onValueChange = { directUrlInput = it },
+                            label = { Text("Прямая ссылка YT/VK/Pikabu/Reddit/Rutube") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Button(
+                            onClick = {
+                                val u = directUrlInput.trim()
+                                if (u.startsWith("http")) {
+                                    downloadingCardId = "direct_url"
+                                    scope.launch {
+                                        val saved = clutterFilter.downloadSourceForManualStudio(u, "Ручная ссылка")
+                                        downloadingCardId = null
+                                        if (saved != null) {
+                                            directUrlInput = ""
+                                            onLoadSourceIntoStudio(saved.videoFile, saved.title, saved.sourceUrl, 0.0, 0.0)
+                                        } else {
+                                            onShowMessage("❌ Не удалось скачать видео по ссылке")
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = downloadingCardId == null && directUrlInput.startsWith("http")
+                        ) {
+                            Text("📥", fontSize = 14.sp)
+                        }
+                        OutlinedButton(onClick = onPickLocalPrimary) {
+                            Text("📱", fontSize = 14.sp)
+                        }
+                    }
+                }
+            }
+
+            sourceJobState.results.forEach { cand ->
+                DiscoveredLinkCard(
+                    candidate = cand,
+                    isDownloading = downloadingCardId == cand.id,
+                    primaryActionLabel = "🎬 В Студию YouCut",
+                    onPrimaryAction = {
+                        downloadingCardId = cand.id
+                        onShowMessage("📥 Скачиваю ролик в Студию YouCut...")
+                        scope.launch {
+                            val saved = clutterFilter.downloadSourceForManualStudio(
+                                sourceUrl = cand.url,
+                                suggestedTitle = cand.title
                             )
+                            downloadingCardId = null
+                            if (saved != null) {
+                                onLoadSourceIntoStudio(saved.videoFile, saved.title, saved.sourceUrl, 0.0, 0.0)
+                            } else {
+                                onShowMessage("❌ Ошибка скачивания ролика")
+                            }
                         }
+                    },
+                    onOpenExternalLink = {
+                        try {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(cand.url)))
+                        } catch (_: Exception) {
+                        }
+                    },
+                    onBanVideo = {
+                        BackgroundCrawlerManager.banCandidateAndPurge(context, cand, banWholeChannel = false)
+                        onShowMessage("🚫 Ролик скрыт навсегда")
+                    },
+                    onBanChannel = {
+                        BackgroundCrawlerManager.banCandidateAndPurge(context, cand, banWholeChannel = true)
+                        onShowMessage("🚷 Канал «${cand.author}» забанен навсегда")
                     }
-
-                    Spacer(Modifier.height(6.dp))
-                    Text(sourceJobState.statusText, color = Color(0xFFA7F3D0), fontSize = 12.sp)
-                }
-            }
-
-            // Live Discovered Source Link Cards
-            if (sourceJobState.results.isNotEmpty()) {
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    "🔗 Найденные ссылки (${sourceJobState.results.size} шт.):",
-                    color = Color.White,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold
                 )
-                Spacer(Modifier.height(6.dp))
-                sourceJobState.results.forEach { cand ->
-                    DiscoveredLinkCard(
-                        candidate = cand,
-                        takeButtonLabel = "✅ Забрать (1080p)",
-                        isDownloading = downloadingCardId == cand.id,
-                        onOpenBrowser = {
-                            try {
-                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(cand.url)))
-                            } catch (_: Exception) {
-                            }
-                        },
-                        onTakeClick = { onDownloadSourceCandidate(cand) },
-                        onBanVideo = {
-                            BackgroundCrawlerManager.banCandidateAndPurge(context, cand, banEntireChannel = false)
-                            onShowMessage("🚫 Ролик скрыт и занесён в бан")
-                        },
-                        onBanChannel = {
-                            BackgroundCrawlerManager.banCandidateAndPurge(context, cand, banEntireChannel = true)
-                            onShowMessage("🚫 Канал «${cand.author}» заблокирован навсегда")
-                        }
-                    )
-                    Spacer(Modifier.height(8.dp))
-                }
-            }
-
-            // Downloaded Studio Inbox Items
-            if (inboxItems.isNotEmpty()) {
-                Spacer(Modifier.height(12.dp))
-                Text(
-                    "📂 Уже скачанные исходники (${inboxItems.size} шт.) — нажми, чтобы переделать или собрать:",
-                    color = Color(0xFF93C5FD),
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(Modifier.height(6.dp))
-                inboxItems.forEach { item ->
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFF171C2B)),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 3.dp)
-                            .clickable { onOpenDownloadedInboxItem(item) }
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(item.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                                Text(
-                                    "${item.durationSec.toInt()}с • ${item.sizeKb / 1024} МБ • ${item.author}",
-                                    color = Color(0xFF9CA3AF),
-                                    fontSize = 11.sp
-                                )
-                            }
-                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Button(
-                                    onClick = { onOpenDownloadedInboxItem(item) },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB)),
-                                    modifier = Modifier.height(32.dp)
-                                ) { Text("Открыть", fontSize = 11.sp) }
-
-                                OutlinedButton(
-                                    onClick = { onDeleteInboxItem(item) },
-                                    modifier = Modifier.height(32.dp)
-                                ) { Text("🗑", fontSize = 11.sp) }
-                            }
-                        }
-                    }
-                }
             }
         } else {
-            // =================================================================
-            // SUB-TAB 2: MODULE 4 — INFINITE LINK-ONLY BACKGROUND HARVESTER!
-            // =================================================================
+            // SUB-TAB 2: PURE MONOTONOUS BACKGROUND FILLER HARVESTER (Frame-by-Frame AI Rejection of Cartoons/Guides!)
             Card(
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF141824)),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Column(modifier = Modifier.padding(12.dp)) {
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "♾ Бесконечный поиск Фонов ССЫЛКАМИ (до кнопки СТОП)",
-                        color = Color.White,
+                        "👁 Фоны-наполнители (Покадровый отсев мультиков и гайдов)",
+                        color = Color(0xFF6EE7B7),
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Ничего не скачивает без спроса! Идёт страница за страницей в фоне по твоему ТОЧНОМУ запросу, пока ты не нажмёшь СТОП.",
+                        "Система скачивает 3 кадра из середины каждого видео (25%, 50%, 75%) и через ML Kit + Gemini Vision автоматически выкидывает мультики, сюжетки, гайды, меню и вебки стримеров — оставляя только однотонный геймплей или резку мыла/песка.",
                         color = Color(0xFF9CA3AF),
                         fontSize = 11.sp
                     )
-                    Spacer(Modifier.height(8.dp))
+
+                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("Subway Surfers", "CS2 surf", "GTA 5 ramp", "Minecraft parkour", "Резка мыла ASMR", "Кинетический песок").forEach { preset ->
+                            FilterChip(
+                                selected = bgQuery.equals(preset, ignoreCase = true),
+                                onClick = { bgQuery = preset },
+                                label = { Text(preset, fontSize = 11.sp) }
+                            )
+                        }
+                    }
 
                     OutlinedTextField(
                         value = bgQuery,
                         onValueChange = { bgQuery = it },
-                        label = { Text("Точная тема фона (например: Subway Surfers, Minecraft Parkour, Мото POV)") },
+                        label = { Text("Тема наполнителя (напр. Subway Surfers, резка мыла)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Spacer(Modifier.height(6.dp))
 
                     OutlinedTextField(
                         value = bgNegInput,
-                        onValueChange = { bgNegInput = it },
-                        label = { Text("Минус-теги (отсечь лишнее: -clutch -ace -donk -reaction)") },
+                        onValueChange = {
+                            bgNegInput = it
+                            SearchBlacklistStore.setBgNegativeTags(context, it)
+                        },
+                        label = { Text("Минус-слова (против гайдов, мультиков и сюжета)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
 
-                    Spacer(Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        HuntPlatform.entries.forEach { p ->
-                            FilterChip(
-                                selected = bgPlatform == p,
-                                onClick = { bgPlatform = p },
-                                label = { Text(p.badge, fontSize = 11.sp) }
-                            )
-                        }
-                    }
-
-                    Spacer(Modifier.height(8.dp))
-                    if (bgJobState.isRunning) {
-                        Button(
-                            onClick = { BackgroundCrawlerManager.stopInfiniteBackgroundCrawl() },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
-                            modifier = Modifier.fillMaxWidth().height(48.dp)
-                        ) {
-                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = Color.White)
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                "⏹ СТОП (Стр. #${bgJobState.pagesCrawled} • Найдено: ${bgJobState.results.size})",
-                                fontWeight = FontWeight.ExtraBold
-                            )
-                        }
-                    } else {
-                        Button(
-                            onClick = {
-                                BackgroundCrawlerManager.startInfiniteBackgroundCrawl(
-                                    context = context,
-                                    query = bgQuery,
-                                    negativeTags = bgNegInput,
-                                    platform = bgPlatform
-                                )
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
-                            modifier = Modifier.fillMaxWidth().height(48.dp)
-                        ) {
-                            Text(
-                                "▶️ ИСКАТЬ ФОНЫ ССЫЛКАМИ ДО СТОПА",
-                                color = Color.Black,
-                                fontWeight = FontWeight.ExtraBold
-                            )
-                        }
-                    }
-
-                    Spacer(Modifier.height(6.dp))
-                    Text(bgJobState.statusText, color = Color(0xFFA7F3D0), fontSize = 12.sp)
-                }
-            }
-
-            if (bgJobState.results.isNotEmpty()) {
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    "🔗 Найденные ссылки на фоны (${bgJobState.results.size} шт.):",
-                    color = Color.White,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(Modifier.height(6.dp))
-                bgJobState.results.forEach { cand ->
-                    DiscoveredLinkCard(
-                        candidate = cand,
-                        takeButtonLabel = "✅ Забрать в Фоны",
-                        isDownloading = downloadingCardId == cand.id,
-                        onOpenBrowser = {
-                            try {
-                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(cand.url)))
-                            } catch (_: Exception) {
-                            }
-                        },
-                        onTakeClick = { onDownloadBgCandidateToPool(cand, bgQuery) },
-                        onBanVideo = {
-                            BackgroundCrawlerManager.banCandidateAndPurge(context, cand, banEntireChannel = false)
-                            onShowMessage("🚫 Ролик убран в бан")
-                        },
-                        onBanChannel = {
-                            BackgroundCrawlerManager.banCandidateAndPurge(context, cand, banEntireChannel = true)
-                            onShowMessage("🚫 Канал «${cand.author}» забанен")
-                        }
-                    )
-                    Spacer(Modifier.height(8.dp))
-                }
-            }
-
-            // Approved Background Pool Manager
-            Spacer(Modifier.height(12.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    "🗂 Мой список фонов (${poolClips.size} шт.):",
-                    color = Color(0xFF34D399),
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                OutlinedButton(onClick = onPickLocalBackground, modifier = Modifier.height(32.dp)) {
-                    Text("📱 Свой с телефона", fontSize = 11.sp)
-                }
-            }
-            Spacer(Modifier.height(6.dp))
-
-            poolClips.forEach { clipFile ->
-                val meta = clutterFilter.getPoolClipMetadata(clipFile)
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF171C2B)),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 3.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(meta.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                            Text("${meta.sizeKb / 1024} МБ • ${meta.tags.joinToString(" ")}", color = Color(0xFF9CA3AF), fontSize = 11.sp)
-                        }
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        if (!bgJobState.isRunning) {
                             Button(
-                                onClick = { onOpenPoolClip(clipFile, meta.title) },
+                                onClick = {
+                                    BackgroundCrawlerManager.startInfiniteBackgroundCrawl(
+                                        context = context,
+                                        query = bgQuery,
+                                        negativeTags = bgNegInput,
+                                        platform = bgPlatform
+                                    )
+                                },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669)),
-                                modifier = Modifier.height(32.dp)
-                            ) { Text("В Редактор", fontSize = 11.sp) }
-
-                            OutlinedButton(
-                                onClick = { onDeletePoolClip(clipFile.name) },
-                                modifier = Modifier.height(32.dp)
-                            ) { Text("🗑", fontSize = 11.sp) }
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("▶️ Искать чистые фоны до СТОПА", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        } else {
+                            Button(
+                                onClick = { BackgroundCrawlerManager.stopInfiniteBackgroundCrawl() },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("⏹ ОСТАНОВИТЬ ПОИСК ФОНОВ", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        }
+                        OutlinedButton(onClick = onPickLocalBackground) {
+                            Text("📱", fontSize = 14.sp)
                         }
                     }
+
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (bgJobState.isRunning) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color(0xFF34D399))
+                        }
+                        Text(bgJobState.statusText, color = Color(0xFFA7F3D0), fontSize = 11.sp)
+                    }
                 }
+            }
+
+            bgJobState.results.forEach { cand ->
+                DiscoveredLinkCard(
+                    candidate = cand,
+                    isDownloading = downloadingCardId == cand.id,
+                    primaryActionLabel = "🕹 В пул фонов и Студию",
+                    onPrimaryAction = {
+                        downloadingCardId = cand.id
+                        onShowMessage("📥 Скачиваю чистый фон в твой пул...")
+                        scope.launch {
+                            val clip = clutterFilter.downloadAndValidateCandidateUrl(
+                                videoUrl = cand.url,
+                                labelPrefix = cand.title.take(18)
+                            )
+                            downloadingCardId = null
+                            if (clip != null) {
+                                onLoadBackgroundIntoStudio(clip, cand.title)
+                            } else {
+                                onShowMessage("❌ Фон не прошёл фильтр плавности или недоступен")
+                            }
+                        }
+                    },
+                    onOpenExternalLink = {
+                        try {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(cand.url)))
+                        } catch (_: Exception) {
+                        }
+                    },
+                    onBanVideo = {
+                        BackgroundCrawlerManager.banCandidateAndPurge(context, cand, banWholeChannel = false)
+                    },
+                    onBanChannel = {
+                        BackgroundCrawlerManager.banCandidateAndPurge(context, cand, banWholeChannel = true)
+                    }
+                )
             }
         }
-
-        Spacer(Modifier.height(24.dp))
     }
 }
 
 @Composable
 private fun DiscoveredLinkCard(
     candidate: DiscoveredMediaCandidate,
-    takeButtonLabel: String,
     isDownloading: Boolean,
-    onOpenBrowser: () -> Unit,
-    onTakeClick: () -> Unit,
+    primaryActionLabel: String,
+    onPrimaryAction: () -> Unit,
+    onOpenExternalLink: () -> Unit,
     onBanVideo: () -> Unit,
     onBanChannel: () -> Unit
 ) {
     Card(
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF181D2C)),
-        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF141824)),
+        shape = RoundedCornerShape(10.dp),
         modifier = Modifier.fillMaxWidth()
     ) {
-        Column(modifier = Modifier.padding(10.dp)) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { onOpenBrowser() },
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                if (candidate.thumbnailUrl.startsWith("http")) {
+        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (candidate.thumbnailUrl.isNotBlank()) {
                     AsyncImage(
                         model = candidate.thumbnailUrl,
                         contentDescription = candidate.title,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier
-                            .width(96.dp)
-                            .height(64.dp)
+                            .size(width = 96.dp, height = 62.dp)
                             .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF0B0D13))
+                            .background(Color.Black)
+                            .clickable { onOpenExternalLink() }
                     )
-                } else {
-                    Box(
-                        modifier = Modifier
-                            .width(96.dp)
-                            .height(64.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF232A3E)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(candidate.platform.badge, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                    }
                 }
 
                 Column(modifier = Modifier.weight(1f)) {
+                    val mins = candidate.durationSec / 60
+                    val secs = candidate.durationSec % 60
                     Text(
-                        text = "[${candidate.platform.badge}] ${candidate.title}",
+                        text = "${candidate.platform.badge} • ${mins}:${secs.toString().padStart(2, '0')} • ${candidate.cloutStatusLabel}",
+                        color = Color(0xFF93C5FD),
+                        fontSize = 10.sp
+                    )
+                    Text(
+                        text = candidate.title,
                         color = Color.White,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
-                    val durMin = candidate.durationSec / 60
-                    val durRem = candidate.durationSec % 60
-                    val durFormatted = String.format(Locale.US, "%02d:%02d", durMin, durRem)
                     Text(
-                        text = "⏱ $durFormatted • 👤 ${candidate.author} • ${candidate.cloutStatusLabel}",
-                        color = Color(0xFF93C5FD),
+                        text = "👤 ${candidate.author}" +
+                            (if (candidate.publishedAgeLabel.isNotBlank()) " • ${candidate.publishedAgeLabel}" else ""),
+                        color = Color(0xFF9CA3AF),
                         fontSize = 11.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = candidate.url,
-                        color = Color(0xFF6EE7B7),
-                        fontSize = 10.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
+            if (candidate.aiWhatsInside.isNotBlank()) {
+                Text(
+                    text = candidate.aiWhatsInside,
+                    color = Color(0xFFFDE68A),
+                    fontSize = 11.sp
+                )
+            }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                OutlinedButton(
-                    onClick = onOpenBrowser,
-                    modifier = Modifier.height(34.dp)
-                ) {
-                    Text("🔗 Открыть", fontSize = 11.sp)
-                }
-
                 Button(
-                    onClick = onTakeClick,
+                    onClick = onPrimaryAction,
                     enabled = !isDownloading,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
-                    modifier = Modifier.weight(1f).height(34.dp)
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF97316)),
+                    modifier = Modifier.weight(1f)
                 ) {
                     if (isDownloading) {
-                        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color.Black)
+                        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color.White)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Качаю...", fontSize = 11.sp)
                     } else {
-                        Text(takeButtonLabel, color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(primaryActionLabel, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     }
                 }
 
-                OutlinedButton(
-                    onClick = onBanVideo,
-                    modifier = Modifier.height(34.dp)
-                ) {
-                    Text("🚫 Видео", fontSize = 10.sp)
+                OutlinedButton(onClick = onOpenExternalLink) {
+                    Text("🌐", fontSize = 12.sp)
                 }
-
-                OutlinedButton(
-                    onClick = onBanChannel,
-                    modifier = Modifier.height(34.dp)
-                ) {
-                    Text("🚫 Канал", fontSize = 10.sp)
+                OutlinedButton(onClick = onBanVideo) {
+                    Text("🚫", fontSize = 12.sp)
+                }
+                OutlinedButton(onClick = onBanChannel) {
+                    Text("🚷", fontSize = 12.sp)
                 }
             }
         }
     }
 }
 
-// =============================================================================
-// TAB 4: API KEYS (GROQ WHISPER + GEMINI + TELEGRAM), BLACKLIST & LIVE LOG
-// =============================================================================
+// =========================================================================
+// TAB 3: CLEAN CREDENTIALS (NO GROQ!) + BLACKLIST + 1500-LINE COPYABLE LOG
+// =========================================================================
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SettingsAndBlacklistScreen(
+private fun SettingsAndLogScreen(
     configStore: NodeConfigStore,
     powerHelper: PowerOptimizationHelper,
     onPickCookiesFile: () -> Unit,
@@ -1259,130 +936,110 @@ private fun SettingsAndBlacklistScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var groqKey by remember { mutableStateOf(configStore.getGroqApiKey()) }
     var geminiKey by remember { mutableStateOf(configStore.getGeminiApiKey()) }
     var tgToken by remember { mutableStateOf(configStore.getTelegramBotToken()) }
     var chatId by remember { mutableStateOf(configStore.getAllowedChatId()) }
 
     val bannedAuthors by SearchBlacklistStore.bannedAuthors.collectAsState()
     val bannedVideos by SearchBlacklistStore.bannedVideoKeys.collectAsState()
+    val seenCount by SearchBlacklistStore.seenCount.collectAsState()
     val logLines by DiagnosticLogger.logFlow.collectAsState()
-    val svcStatus by PipelineForegroundService.statusFlow.collectAsState()
+    val svcStatus by PipelineForegroundService.serviceStateFlow.collectAsState()
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        // 1. Credentials (ONLY Gemini + Telegram — zero extra keys!)
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF141824)),
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Text("🔑 API Ключи (Groq Whisper + Gemini + Telegram)", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("🔑 Ключи (Никаких лишних регистраций — только Gemini и Бот)", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                 Text("Статус сервиса: $svcStatus", color = Color(0xFF6EE7B7), fontSize = 11.sp)
-                Spacer(Modifier.height(8.dp))
-
-                OutlinedTextField(
-                    value = groqKey,
-                    onValueChange = { groqKey = it },
-                    label = { Text("🎙 Groq API Key (gsk_...) — Точные субтитры Whisper-v3-Turbo") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(6.dp))
 
                 OutlinedTextField(
                     value = geminiKey,
                     onValueChange = { geminiKey = it },
-                    label = { Text("🧠 Gemini API Key (AIza...) — Озвучка TTS, Рерайт, Shazam") },
+                    label = { Text("🧠 Gemini API Key (субтитры по волне, ИИ-отсев ЦА и кадров)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Spacer(Modifier.height(6.dp))
 
                 OutlinedTextField(
                     value = tgToken,
                     onValueChange = { tgToken = it },
-                    label = { Text("🤖 Telegram Bot Token") },
+                    label = { Text("🤖 Telegram Bot Token (по желанию)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Spacer(Modifier.height(6.dp))
 
                 OutlinedTextField(
                     value = chatId,
                     onValueChange = { chatId = it },
-                    label = { Text("🔒 Разрешённый Chat ID (пусто = любой)") },
+                    label = { Text("👤 Разрешённый Chat ID (пусто = любой)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Spacer(Modifier.height(10.dp))
 
                 Button(
                     onClick = {
-                        configStore.setGroqApiKey(groqKey)
                         configStore.setGeminiApiKey(geminiKey)
                         configStore.setTelegramBotToken(tgToken)
                         configStore.setAllowedChatId(chatId)
-                        DiagnosticLogger.log("UI", "Пользователь сохранил ключи (Groq + Gemini + Telegram) и перезапустил узел.")
+                        DiagnosticLogger.log("UI", "Ключи Gemini и Telegram сохранены.")
                         PipelineForegroundService.reloadCredentials(context)
-                        onShowMessage("✅ Ключи сохранены, узел перезапущен!")
+                        onShowMessage("✅ Ключи сохранены!")
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
-                    modifier = Modifier.fillMaxWidth().height(44.dp)
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669)),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("💾 СОХРАНИТЬ КЛЮЧИ И ПЕРЕЗАПУСТИТЬ", color = Color.Black, fontWeight = FontWeight.Bold)
+                    Text("💾 Сохранить и перезапустить узел", fontWeight = FontWeight.Bold)
                 }
             }
         }
 
-        // Blacklist Manager Card
+        // 2. Blacklist & Seen History Management
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF141824)),
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
-            Column(modifier = Modifier.padding(12.dp)) {
+            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "🚫 Чёрный список поиска (Каналов: ${bannedAuthors.size} • Роликов: ${bannedVideos.size})",
+                    "🚷 ЧС и память выдачи (Каналов: ${bannedAuthors.size}, Роликов: ${bannedVideos.size / 2}, Просмотрено: $seenCount)",
                     color = Color.White,
-                    fontSize = 14.sp,
+                    fontSize = 13.sp,
                     fontWeight = FontWeight.Bold
                 )
-                Spacer(Modifier.height(6.dp))
-
                 if (bannedAuthors.isNotEmpty()) {
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         bannedAuthors.forEach { ch ->
                             FilterChip(
                                 selected = true,
                                 onClick = { SearchBlacklistStore.unbanChannel(context, ch) },
-                                label = { Text("✖ $ch", fontSize = 11.sp) }
+                                label = { Text("✕ $ch", fontSize = 11.sp) }
                             )
                         }
                     }
-                    Spacer(Modifier.height(6.dp))
                 }
-
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
-                        onClick = { SearchBlacklistStore.clearBannedChannels(context) },
-                        modifier = Modifier.weight(1f)
-                    ) { Text("Разбанить все каналы", fontSize = 11.sp) }
-
-                    OutlinedButton(
-                        onClick = { SearchBlacklistStore.clearBannedVideos(context) },
-                        modifier = Modifier.weight(1f)
-                    ) { Text("Очистить бан видео", fontSize = 11.sp) }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(onClick = { SearchBlacklistStore.clearSeenHistory(context) }, modifier = Modifier.weight(1f)) {
+                        Text("🔄 Сброс просмотренных", fontSize = 10.sp)
+                    }
+                    OutlinedButton(onClick = { SearchBlacklistStore.clearBannedChannels(context) }, modifier = Modifier.weight(1f)) {
+                        Text("Разбанить каналы", fontSize = 10.sp)
+                    }
                 }
             }
         }
 
-        // System Tools: Cookies, OxygenOS Battery, yt-dlp updater
+        // 3. OnePlus / OxygenOS & yt-dlp tools
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF141824)),
             shape = RoundedCornerShape(12.dp),
@@ -1436,35 +1093,85 @@ private fun SettingsAndBlacklistScreen(
             }
         }
 
-        // Live Diagnostic Log Viewer
+        // 4. FULL 1500-LINE SCROLLABLE DIAGNOSTIC LOG WITH 1-TAP COPY & SHARE!
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF0F131D)),
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
-            Column(modifier = Modifier.padding(12.dp)) {
+            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("📜 Живой лог узла (${logLines.size} строк)", color = Color(0xFF93C5FD), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "📜 Полный лог узла (${logLines.size} / 1500 строк)",
+                        color = Color(0xFF93C5FD),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
                     TextButton(onClick = { DiagnosticLogger.clear(context) }) {
-                        Text("Очистить", fontSize = 11.sp)
+                        Text("Очистить", fontSize = 11.sp, color = Color(0xFFF87171))
                     }
                 }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    Button(
+                        onClick = {
+                            val fullText = DiagnosticLogger.getAllLinesText()
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("PocketMediaForgeLog", fullText))
+                            onShowMessage("📋 Весь лог (${logLines.size} строк) скопирован в буфер обмена!")
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB)),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("📋 Скопировать весь лог", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            val fullText = DiagnosticLogger.getAllLinesText()
+                            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_SUBJECT, "Pocket Media Forge Log")
+                                putExtra(Intent.EXTRA_TEXT, fullText)
+                            }
+                            try {
+                                context.startActivity(Intent.createChooser(sendIntent, "Отправить лог"))
+                            } catch (_: Exception) {
+                            }
+                        }
+                    ) {
+                        Text("📤 Поделиться", fontSize = 12.sp)
+                    }
+                }
+
+                val logScroll = rememberScrollState()
+                LaunchedEffect(logLines.size) {
+                    logScroll.scrollTo(logScroll.maxValue)
+                }
+
                 Surface(
                     color = Color(0xFF07090E),
                     shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 180.dp, max = 380.dp)
                 ) {
-                    Text(
-                        text = logLines.takeLast(60).joinToString("\n").ifBlank { "Лог пуст." },
-                        color = Color(0xFFD1D5DB),
-                        fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.padding(8.dp)
-                    )
+                    SelectionContainer {
+                        Text(
+                            text = logLines.joinToString("\n").ifBlank { "Лог пуст." },
+                            color = Color(0xFFD1D5DB),
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier
+                                .verticalScroll(logScroll)
+                                .horizontalScroll(rememberScrollState())
+                                .padding(8.dp)
+                        )
+                    }
                 }
             }
         }
